@@ -76,6 +76,16 @@ pub struct SimConfig {
     /// sqrt(n) of them that relay it on.
     #[arg(long)]
     pub parlia_direct: bool,
+    /// Parlia: how far back a header's vote attestation may reach. 1 is the pre-Fermi rule
+    /// (parent only); Fermi raised it to 3 (`kAncestorGenerationDepth`), so a block whose votes
+    /// arrive after the next seal can still be justified by a later header.
+    #[arg(long, default_value_t = 1)]
+    pub attest_depth: u64,
+    /// Parlia: relay blocks as compact blocks, sending this many bytes per transaction (a short
+    /// id) instead of the full transaction. Assumes every receiver already holds every
+    /// transaction, so it is a lower bound on the wire cost.
+    #[arg(long)]
+    pub compact_tx_bytes: Option<u64>,
     /// Parlia: delay per backoff rank before another validator fills a missing in-turn block.
     #[arg(long, default_value_t = 1000)]
     pub backoff_ms: u64,

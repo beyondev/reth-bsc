@@ -1,9 +1,11 @@
 //! Today's flow: Parlia block production with fast-finality votes.
 //!
 //! The in-turn proposer builds and executes a full block, broadcasts it, and every validator
-//! re-executes it before voting. The next proposer attests the parent if it has a quorum of
-//! verified votes when it seals. When the turn passes to another validator, that validator must
-//! import the parent first.
+//! re-executes it before voting. When it seals, the next proposer attests the nearest of the
+//! last `attest_depth` ancestors above the justified block that has a quorum of verified votes.
+//! As in geth's `Snapshot.updateAttestation`, an attestation whose target is the block right
+//! after its source finalizes the source; any other attestation only moves the justified block.
+//! When the turn passes to another validator, that validator must import the parent first.
 //!
 //! When the in-turn validator is down, or its blocks are rejected because it executes wrongly,
 //! the honest validator with the best backoff rank produces the block after `rank * backoff`.
@@ -55,7 +57,11 @@ struct Block {
     seal: u64,
     exec_cost: f64,
     bytes: u64,
-    attests_parent: bool,
+    /// Block justified by this header's attestation, if it carries one.
+    attest_target: Option<u64>,
+    /// Justified and finalized block after applying this header.
+    justified: u64,
+    finalized: u64,
     out_of_turn: bool,
     /// Peers each validator forwards the block to after receiving it.
     relay: Vec<Vec<usize>>,
@@ -149,7 +155,11 @@ pub fn run(env: &Env<'_>) -> Report {
                 // than the time left.
                 let built = cpu.exec(v, now, exec_cost);
                 let seal = cpu.sig(v, built.max(not_before), env.crypto.ecdsa_sign);
-                let bytes = HEADER_BYTES + chosen.iter().map(|&i| txs[i].size()).sum::<u64>();
+                let bytes = HEADER_BYTES +
+                    match cfg.compact_tx_bytes {
+                        Some(per_tx) => per_tx * chosen.len() as u64,
+                        None => chosen.iter().map(|&i| txs[i].size()).sum::<u64>(),
+                    };
                 blocks.push(Block {
                     proposer: v,
                     txs: chosen,
@@ -166,9 +176,21 @@ pub fn run(env: &Env<'_>) -> Report {
             }
             Event::Seal(h) => {
                 let p = blocks[h as usize].proposer;
-                let parent_votes =
-                    vote_times[h as usize - 1][p].iter().filter(|&&t| t <= now).count();
-                blocks[h as usize].attests_parent = h > 1 && parent_votes >= cfg.quorum();
+                let (source, finalized) =
+                    (blocks[h as usize - 1].justified, blocks[h as usize - 1].finalized);
+                let target = (1..=cfg.attest_depth)
+                    .map_while(|d| h.checked_sub(d).filter(|&t| t > source))
+                    .find(|&t| {
+                        vote_times[t as usize][p].iter().filter(|&&at| at <= now).count() >=
+                            cfg.quorum()
+                    });
+                let b = &mut blocks[h as usize];
+                b.attest_target = target;
+                (b.justified, b.finalized) = match target {
+                    Some(t) if t == source + 1 => (t, source),
+                    Some(t) => (t, finalized),
+                    None => (source, finalized),
+                };
                 // Like geth's block propagation: the full block goes to sqrt(peers) validators,
                 // nearest first, and each of them forwards it to its share of the rest once the
                 // header checks out. Validators that reject the chain are served last.
@@ -262,10 +284,9 @@ pub fn run(env: &Env<'_>) -> Report {
         }
     }
 
-    // Finality through attestations in headers: block h is final once some j >= h is attested
-    // by j + 1 and j + 1 by j + 2; the median validator learns it when it imports j + 2.
+    // Finality through attestations in headers: block b is final once the median validator has
+    // imported the first header whose finalized block is at least b.
     let last = blocks.len() as u64 - 1;
-    let attested = |j: u64| j < last && blocks[j as usize + 1].attests_parent;
     let median_import = |h: u64| -> Option<u64> {
         let times: Vec<u64> = honest.iter().filter_map(|&v| imported.get(h as usize)?[v]).collect();
         if times.len() < honest.len() {
@@ -274,12 +295,12 @@ pub fn run(env: &Env<'_>) -> Report {
         median(times)
     };
     let mut final_at: Vec<Option<u64>> = vec![None; blocks.len()];
-    let mut next_final: Option<u64> = None;
-    for j in (1..=last).rev() {
-        if attested(j) && attested(j + 1) {
-            next_final = median_import(j + 2);
+    let mut next = 1u64;
+    for h in 1..=last {
+        while next <= blocks[h as usize].finalized {
+            final_at[next as usize] = median_import(h);
+            next += 1;
         }
-        final_at[j as usize] = next_final;
     }
 
     let mut times = TxTimes::new(txs.len());
@@ -354,13 +375,19 @@ pub fn run(env: &Env<'_>) -> Report {
     let block_times: Vec<u64> = blocks.iter().skip(1).map(|b| b.seal).collect();
     let window_blocks: Vec<&Block> = in_window.iter().map(|&h| &blocks[h as usize]).collect();
     let late = window_blocks.iter().filter(|b| b.seal > b.target + 1000).count();
-    let attested_blocks = window_blocks.iter().filter(|b| b.attests_parent).count();
+    let attested_blocks = window_blocks.iter().filter(|b| b.attest_target.is_some()).count();
+    let lagged = window_blocks
+        .iter()
+        .zip(&in_window)
+        .filter(|(b, &h)| b.attest_target.is_some_and(|t| t + 1 < h))
+        .count();
     let mean_exec =
         window_blocks.iter().map(|b| b.exec_cost).sum::<f64>() / window_blocks.len().max(1) as f64;
     let count = window_blocks.len();
     let extra = vec![
         ("blocks sealed late (>1ms)".to_string(), format!("{late} / {count}")),
-        ("blocks with parent attestation".to_string(), format!("{attested_blocks} / {count}")),
+        ("blocks with an attestation".to_string(), format!("{attested_blocks} / {count}")),
+        ("attestations below the parent".to_string(), format!("{lagged} / {count}")),
         ("mean block execution (ms)".to_string(), format!("{:.1}", mean_exec / 1000.0)),
         ("failed txs".to_string(), failed_txs.to_string()),
     ];
@@ -419,7 +446,7 @@ fn import(
 ) {
     let b = &blocks[h as usize];
     let mut checks = env.crypto.ecdsa_recover;
-    if b.attests_parent {
+    if b.attest_target.is_some() {
         checks += env.crypto.bls_agg_verify;
     }
     let checked = cpu.sig(v, at, checks);
