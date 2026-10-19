@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "testing/bsc-ef-tests"]
+members = [".", "testing/bsc-ef-tests", "testing/dx-demo"]
 
 [package]
 name = "reth_bsc"
