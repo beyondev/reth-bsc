@@ -81,6 +81,11 @@ pub struct SimConfig {
     /// arrive after the next seal can still be justified by a later header.
     #[arg(long, default_value_t = 1)]
     pub attest_depth: u64,
+    /// Parlia: a header may carry one attestation for every ancestor within `attest_depth` that
+    /// has a quorum, applied oldest first, instead of only the nearest one. Not in any fork yet;
+    /// it shows what a multi-target attestation would buy when votes arrive late.
+    #[arg(long)]
+    pub multi_attest: bool,
     /// Parlia: relay blocks as compact blocks, sending this many bytes per transaction (a short
     /// id) instead of the full transaction. Assumes every receiver already holds every
     /// transaction, so it is a lower bound on the wire cost.

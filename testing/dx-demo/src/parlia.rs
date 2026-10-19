@@ -59,6 +59,8 @@ struct Block {
     bytes: u64,
     /// Block justified by this header's attestation, if it carries one.
     attest_target: Option<u64>,
+    /// Number of attestations this header carries.
+    attestations: u64,
     /// Justified and finalized block after applying this header.
     justified: u64,
     finalized: u64,
@@ -176,21 +178,28 @@ pub fn run(env: &Env<'_>) -> Report {
             }
             Event::Seal(h) => {
                 let p = blocks[h as usize].proposer;
-                let (source, finalized) =
+                let (mut justified, mut finalized) =
                     (blocks[h as usize - 1].justified, blocks[h as usize - 1].finalized);
-                let target = (1..=cfg.attest_depth)
-                    .map_while(|d| h.checked_sub(d).filter(|&t| t > source))
-                    .find(|&t| {
-                        vote_times[t as usize][p].iter().filter(|&&at| at <= now).count() >=
-                            cfg.quorum()
-                    });
-                let b = &mut blocks[h as usize];
-                b.attest_target = target;
-                (b.justified, b.finalized) = match target {
-                    Some(t) if t == source + 1 => (t, source),
-                    Some(t) => (t, finalized),
-                    None => (source, finalized),
+                let has_quorum = |t: u64| {
+                    vote_times[t as usize][p].iter().filter(|&&at| at <= now).count() >=
+                        cfg.quorum()
                 };
+                let window = h.saturating_sub(cfg.attest_depth).max(justified + 1)..h;
+                let targets: Vec<u64> = if cfg.multi_attest {
+                    window.filter(|&t| has_quorum(t)).collect()
+                } else {
+                    window.rev().find(|&t| has_quorum(t)).into_iter().collect()
+                };
+                for &t in &targets {
+                    if t == justified + 1 {
+                        finalized = justified;
+                    }
+                    justified = t;
+                }
+                let b = &mut blocks[h as usize];
+                b.attestations = targets.len() as u64;
+                b.attest_target = targets.last().copied();
+                (b.justified, b.finalized) = (justified, finalized);
                 // Like geth's block propagation: the full block goes to sqrt(peers) validators,
                 // nearest first, and each of them forwards it to its share of the rest once the
                 // header checks out. Validators that reject the chain are served last.
@@ -446,9 +455,7 @@ fn import(
 ) {
     let b = &blocks[h as usize];
     let mut checks = env.crypto.ecdsa_recover;
-    if b.attest_target.is_some() {
-        checks += env.crypto.bls_agg_verify;
-    }
+    checks += b.attestations as f64 * env.crypto.bls_agg_verify;
     let checked = cpu.sig(v, at, checks);
     let recovered = cpu.parallel(v, at, b.txs.len() as f64 * env.crypto.ecdsa_recover);
     let executed = cpu.exec(v, at, b.exec_cost);
