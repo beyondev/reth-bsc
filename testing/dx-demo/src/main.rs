@@ -65,6 +65,19 @@ enum Cmd {
         #[arg(long)]
         json: Option<PathBuf>,
     },
+    /// Run the six fault and load scenarios (4 validators, 50 ms blocks) three times each and
+    /// write a block-level Markdown table.
+    Scenarios {
+        /// Markdown output file.
+        #[arg(long, default_value = "dx-demo-scenarios.md")]
+        out: PathBuf,
+        /// Also write every run's report as JSON.
+        #[arg(long)]
+        json: Option<PathBuf>,
+        /// Seeds to run each scenario with; the run with the median block rate is shown.
+        #[arg(long, value_delimiter = ',', default_value = "1,2,3")]
+        seeds: Vec<u64>,
+    },
     /// Run the built-in scenario set and write a Markdown report.
     Sweep {
         #[command(flatten)]
@@ -111,6 +124,15 @@ fn main() {
                 std::fs::write(path, body).expect("writable output");
             }
         }
+        Cmd::Scenarios { out, json, seeds } => {
+            let (md, runs) = scenarios(&seeds);
+            std::fs::write(&out, md).expect("writable output");
+            println!("wrote {}", out.display());
+            if let Some(path) = json {
+                let body = serde_json::to_string_pretty(&runs).expect("serializable");
+                std::fs::write(path, body).expect("writable output");
+            }
+        }
         Cmd::Sweep { cfg, out } => {
             let md = sweep(&cfg);
             std::fs::write(&out, md).expect("writable output");
@@ -120,7 +142,7 @@ fn main() {
 }
 
 fn run_scenario(cfg: &SimConfig, crypto: &CryptoCosts, which: Which) -> Vec<Report> {
-    let topo = Topology::new(cfg.validators, cfg.seed);
+    let topo = Topology::new(cfg.validators, cfg.seed, cfg.latency_ms);
     let workload = Workload::generate(cfg, &topo);
     let exec_model = ExecCostModel::calibrate(cfg);
     let env = Env {
@@ -159,6 +181,174 @@ struct Scenario {
     note: &'static str,
     apply: fn(&mut SimConfig),
 }
+
+/// Base configuration of the `scenarios` command: 4 validators, 2000 tx/s, every block takes
+/// 20 ms to execute, 5 ms ± 2 ms one-way latency, 1 Gbit/s uplinks, 50 ms blocks, 4 blocks per
+/// proposer, `k = 3`, 1 s Parlia backoff, 100 ms DX `T_base`, a 10 s measurement window.
+const SCENARIO_BASE: &[&str] = &[
+    "dx-demo",
+    "--validators",
+    "4",
+    "--tps",
+    "2000",
+    "--exec-block-ms",
+    "20",
+    "--latency-ms",
+    "5",
+    "--jitter-ms",
+    "2",
+    "--block-interval-ms",
+    "50",
+    "--min-interval-ms",
+    "50",
+    "--turn-length",
+    "4",
+    "--exec-lag",
+    "3",
+    "--backoff-ms",
+    "1000",
+    "--round-timeout-ms",
+    "100",
+    "--duration-s",
+    "11",
+    "--warmup-s",
+    "1",
+];
+
+/// One protocol variant of the `scenarios` command.
+struct Variant {
+    label: &'static str,
+    which: Which,
+    apply: fn(&mut SimConfig),
+}
+
+/// One run of the `scenarios` command, kept for the JSON output.
+#[derive(Debug, serde::Serialize)]
+struct ScenarioRun {
+    scenario: &'static str,
+    variant: &'static str,
+    seed: u64,
+    report: Report,
+}
+
+/// Command line holding only a [`SimConfig`], to parse [`SCENARIO_BASE`].
+#[derive(Debug, Parser)]
+struct ConfigArgs {
+    #[command(flatten)]
+    cfg: SimConfig,
+}
+
+fn scenario_base() -> SimConfig {
+    ConfigArgs::parse_from(SCENARIO_BASE).cfg
+}
+
+fn scenarios(seeds: &[u64]) -> (String, Vec<ScenarioRun>) {
+    let base = scenario_base();
+    let scenarios = [
+        Scenario {
+            title: "baseline",
+            note: "n = 4, 2000 tx/s, E = 20 ms, d = 5 ms",
+            apply: |_| {},
+        },
+        Scenario { title: "high load", note: "4000 tx/s", apply: |c| c.tps = 4000.0 },
+        Scenario {
+            title: "slow execution",
+            note: "E = 100 ms, longer than the block interval",
+            apply: |c| c.exec_block_ms = Some(100.0),
+        },
+        Scenario { title: "slow network", note: "d = 20 ms", apply: |c| c.latency_ms = Some(20.0) },
+        Scenario {
+            title: "one validator down",
+            note: "validator 1 neither proposes nor votes",
+            apply: |c| c.crashed = vec![1],
+        },
+        Scenario {
+            title: "one validator executes wrongly",
+            note: "validator 3 reports a wrong state root",
+            apply: |c| c.bad_exec = vec![3],
+        },
+    ];
+    let variants = [
+        Variant { label: "Parlia", which: Which::Parlia, apply: |_| {} },
+        Variant { label: "DX, QC broadcast", which: Which::Dx, apply: |c| c.qc_broadcast = true },
+        Variant { label: "DX, QC in next proposal", which: Which::Dx, apply: |_| {} },
+    ];
+
+    let crypto = CryptoCosts::calibrate(base.quorum());
+    let mut runs = Vec::new();
+    let mut md = String::from("# dx-demo fault and load scenarios\n\n");
+    md.push_str(SCENARIO_LEGEND);
+    md.push_str(
+        "| scenario | protocol | blocks/s (range) | tx/s | critical B | state gap p50 | \
+         2/3 signed state p50 | DX QC p50 | irreversible p50 (range) | irreversible p99 | \
+         faults | safe |\n",
+    );
+    md.push_str("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n");
+    for s in &scenarios {
+        for variant in &variants {
+            let mut reports: Vec<(u64, Report)> = seeds
+                .iter()
+                .map(|&seed| {
+                    let mut cfg = base.clone();
+                    cfg.seed = seed;
+                    (s.apply)(&mut cfg);
+                    (variant.apply)(&mut cfg);
+                    eprintln!("== {} / {} / seed {seed}", s.title, variant.label);
+                    let report = run_scenario(&cfg, &crypto, variant.which).remove(0);
+                    (seed, report)
+                })
+                .collect();
+            reports.sort_by(|a, b| a.1.block.blocks_per_s.total_cmp(&b.1.block.blocks_per_s));
+            let range = |f: fn(&Report) -> f64| {
+                let v: Vec<f64> = reports.iter().map(|(_, r)| f(r)).collect();
+                let lo = v.iter().copied().fold(f64::INFINITY, f64::min);
+                let hi = v.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                format!("{lo:.1}–{hi:.1}")
+            };
+            let bps = range(|r| r.block.blocks_per_s);
+            let irr = range(|r| r.block.irreversible_p50_ms);
+            let b = &reports[reports.len() / 2].1.block;
+            md.push_str(&format!(
+                "| {} ({}) | {} | {:.1} ({bps}) | {:.0} | {:.0} | {:.1} | {:.1} | {:.1} | {:.1} ({irr}) | {:.0} | {} | {} |\n",
+                s.title,
+                s.note,
+                variant.label,
+                b.blocks_per_s,
+                b.tps,
+                b.critical_bytes,
+                b.state_gap_p50_ms,
+                b.quorum_sig_p50_ms,
+                b.order_qc_p50_ms,
+                b.irreversible_p50_ms,
+                b.irreversible_p99_ms,
+                b.faults,
+                if b.safe { "yes" } else { "NO" },
+            ));
+            runs.extend(reports.into_iter().map(|(seed, report)| ScenarioRun {
+                scenario: s.title,
+                variant: variant.label,
+                seed,
+                report,
+            }));
+        }
+    }
+    md.push_str("\n## Configuration\n\n```json\n");
+    md.push_str(&serde_json::to_string_pretty(&base).expect("serializable"));
+    md.push_str("\n```\n\n## Measured signature costs (µs)\n\n```json\n");
+    md.push_str(&serde_json::to_string_pretty(&crypto).expect("serializable"));
+    md.push_str("\n```\n");
+    (md, runs)
+}
+
+/// Explains the columns of the `scenarios` table.
+const SCENARIO_LEGEND: &str = "Each row is the run with the median block rate out of the seeds; \
+ranges are over all seeds. Latencies are in ms and measured from the moment a block leaves its \
+proposer, at the median honest validator. `critical B` is the mean size of the block message \
+(Parlia: full block, rejected blocks included; DX: proposal). `state gap` is how much later an \
+honest validator has the block's execution result than its proposer. `2/3 signed state` is when \
+2/3 have signed the execution result (Parlia: votes; DX: ExecCert); `DX QC` is when the order \
+QC forms. `irreversible` is Parlia: block and child both have 2/3 votes; DX: committed and \
+ExecCert. `faults` counts Parlia blocks produced after a backoff and DX rounds ended by a TC.\n\n";
 
 fn sweep(base: &SimConfig) -> String {
     let scenarios = [
@@ -290,12 +480,6 @@ fn sweep(base: &SimConfig) -> String {
 mod tests {
     use super::*;
 
-    #[derive(Debug, Parser)]
-    struct Args {
-        #[command(flatten)]
-        cfg: SimConfig,
-    }
-
     fn small(extra: &[&str]) -> SimConfig {
         let mut argv = vec![
             "dx-demo",
@@ -311,7 +495,58 @@ mod tests {
             "2000",
         ];
         argv.extend_from_slice(extra);
-        Args::parse_from(argv).cfg
+        ConfigArgs::parse_from(argv).cfg
+    }
+
+    /// The `scenarios` base configuration, shortened and at a lighter load to keep tests fast.
+    fn fault_base() -> SimConfig {
+        let mut cfg = scenario_base();
+        cfg.tps = 500.0;
+        cfg.accounts = 2000;
+        cfg.duration_s = 5.0;
+        cfg
+    }
+
+    #[test]
+    fn dx_skips_a_crashed_leader_while_parlia_waits_for_backoff() {
+        let mut cfg = fault_base();
+        cfg.crashed = vec![1];
+        let crypto = CryptoCosts::calibrate(cfg.quorum());
+        let parlia = &run_scenario(&cfg, &crypto, Which::Parlia)[0].block;
+        assert!(parlia.blocks_per_s < 5.0, "{}", parlia.blocks_per_s);
+        assert!(parlia.faults > 0);
+        for qc_broadcast in [true, false] {
+            cfg.qc_broadcast = qc_broadcast;
+            let dx = &run_scenario(&cfg, &crypto, Which::Dx)[0].block;
+            assert!(dx.safe);
+            assert!(dx.faults > 0, "qc_broadcast {qc_broadcast}");
+            assert!(dx.blocks_per_s > 10.0, "qc_broadcast {qc_broadcast}: {}", dx.blocks_per_s);
+        }
+    }
+
+    #[test]
+    fn a_wrong_state_root_stalls_parlia_but_not_dx_ordering() {
+        let mut cfg = fault_base();
+        cfg.bad_exec = vec![3];
+        cfg.qc_broadcast = true;
+        let crypto = CryptoCosts::calibrate(cfg.quorum());
+        let reports = run_scenario(&cfg, &crypto, Which::Both);
+        let (parlia, dx) = (&reports[0].block, &reports[1].block);
+        assert!(parlia.blocks_per_s < 5.0, "{}", parlia.blocks_per_s);
+        assert!(dx.safe);
+        assert_eq!(dx.faults, 0);
+        assert!(dx.blocks_per_s > 19.0, "{}", dx.blocks_per_s);
+        assert!(dx.irreversible_p50_ms < 100.0, "{}", dx.irreversible_p50_ms);
+    }
+
+    #[test]
+    fn dx_execution_backpressure_bounds_the_block_rate() {
+        let mut cfg = fault_base();
+        cfg.exec_block_ms = Some(100.0);
+        let crypto = CryptoCosts::calibrate(cfg.quorum());
+        let dx = &run_scenario(&cfg, &crypto, Which::Dx)[0].block;
+        // k = 3 blocks may be unexecuted, so 100 ms blocks allow at most 10 per second.
+        assert!((dx.blocks_per_s - 10.0).abs() < 0.5, "{}", dx.blocks_per_s);
     }
 
     #[test]

@@ -1,21 +1,24 @@
-//! The DX two-phase design (`bsc-decoupled-consensus-design.md` v2.1), without faults.
+//! The DX two-phase design (`bsc-decoupled-consensus-design.md` v2.1).
 //!
 //! - Dissemination: the owner of a sender cuts its transactions into batches every `T_batch`, signs
 //!   them with Ed25519 and broadcasts them. Receivers verify, recover senders, store and return a
-//!   BLS ack. `f + 1` acks form a PoA, which the author broadcasts.
+//!   BLS ack. `f + 1` acks form a PoA, which the author broadcasts. A down owner's transactions are
+//!   batched by the next validator after `T_fallback`.
 //! - Ordering: Jolteon-style rounds with `TurnLength` consecutive rounds per leader. A proposal
 //!   carries PoA digests only. Votes go to the next leader, whose quorum forms the QC. A block is
-//!   committed when the QC of its child is known (two-chain rule).
-//! - Execution: every validator executes committed blocks in order, signs an ExecVote and
-//!   broadcasts it. `2f + 1` ExecVotes form the ExecCert. A leader may only propose round `r` once
-//!   it holds the ExecCert of block `r - k` (backpressure).
-//!
-//! Timeouts, view changes and batch fetching are not exercised because no validator fails.
+//!   committed when its child, from the next round, is certified (two-chain rule). A round that
+//!   gets no QC times out after `T_base * 2^c`; a Timeout carries its sender's highest QC, `2f + 1`
+//!   timeouts form a TC, and a TC skips the rest of that leader's turn (design §12.1). With
+//!   `--qc-broadcast` the leader that forms a QC also broadcasts it at once.
+//! - Execution: validators execute verified proposals speculatively and committed blocks in order,
+//!   sign an ExecVote for committed blocks and broadcast it. `2f + 1` matching ExecVotes form the
+//!   ExecCert. A leader may only propose height `h` once it holds the ExecCert of height `h - k`
+//!   (backpressure). ExecVotes from a wrongly executing validator never match.
 
 use crate::{
     exec::ExecEngine,
     net::Network,
-    report::{median, Report, RunOutput, TxTimes},
+    report::{median, percentile_ms, BlockStats, Report, RunOutput, TxTimes},
     sim::{Cpu, EventQueue},
     workload::Tx,
     Env,
@@ -27,9 +30,14 @@ const BATCH_OVERHEAD: u64 = 160;
 const ACK_BYTES: u64 = 140;
 /// PoA: digest, author, gas, signer bitmap, aggregate BLS signature.
 const POA_BYTES: u64 = 170;
-/// Proposal header with parent QC and the ExecCert of block `r - k`.
+/// Proposal header with parent QC and the ExecCert of height `h - k`.
 const PROPOSAL_HEADER_BYTES: u64 = 900;
-/// OrderVote and ExecVote.
+/// TC carried by the first proposal after a timeout.
+const TC_BYTES: u64 = 250;
+/// QC on its own (broadcast, or carried in a Timeout): round, block hash, signer bitmap, aggregate
+/// BLS signature.
+const QC_BYTES: u64 = 200;
+/// OrderVote, Timeout and ExecVote.
 const VOTE_BYTES: u64 = 200;
 /// Gas declared per batch at most (`G_batch`).
 const G_BATCH: u64 = 10_000_000;
@@ -37,6 +45,8 @@ const G_BATCH: u64 = 10_000_000;
 const D_SPEC: u64 = 8;
 /// Retry interval while a block waits for a batch body.
 const BODY_POLL_US: u64 = 1000;
+/// Cap on the timeout doubling exponent.
+const MAX_BACKOFF_EXP: u32 = 6;
 
 #[derive(Debug)]
 enum Event {
@@ -48,18 +58,25 @@ enum Event {
     Ack(usize),
     /// The PoA of batch `b` reaches validator `v`.
     Poa { v: usize, b: usize },
-    /// The leader of round `r` proposes.
+    /// The leader of round `r` proposes, if it is still in that round.
     Propose(u64),
-    /// The proposal of round `r` reaches validator `v`.
-    Proposal { v: usize, r: u64 },
-    /// An OrderVote for round `r` reaches the next leader.
-    Vote(u64),
-    /// Validator `v` may start executing committed block `r`.
-    ExecReady { v: usize, r: u64 },
-    /// Validator `v` finished executing block `r`.
-    Executed { v: usize, r: u64 },
-    /// An ExecVote for block `r` reaches validator `v`.
-    ExecVote { v: usize, r: u64 },
+    /// Proposal `blk` reaches validator `v`.
+    Proposal { v: usize, blk: usize },
+    /// The QC of round `r`, broadcast by the leader that formed it, reaches validator `v`.
+    Qc { v: usize, r: u64 },
+    /// An OrderVote for round `r` reaches validator `to`.
+    Vote { to: usize, r: u64 },
+    /// Validator `v`'s timer for round `r` fires.
+    Timer { v: usize, r: u64 },
+    /// A Timeout for round `r`, carrying the sender's highest QC (block `high_qc`), reaches
+    /// validator `v`.
+    Timeout { v: usize, r: u64, high_qc: usize },
+    /// Validator `v` may start executing block `blk`.
+    ExecReady { v: usize, blk: usize },
+    /// Validator `v` finished executing block `blk`.
+    Executed { v: usize, blk: usize },
+    /// An ExecVote for `blk` from `from` reaches validator `v`.
+    ExecVote { v: usize, from: usize, blk: usize },
 }
 
 #[derive(Debug)]
@@ -74,25 +91,44 @@ struct Batch {
     stored_at: Vec<Option<u64>>,
     /// PoA verified and cached at each validator.
     poa_at: Vec<Option<u64>>,
-    included: bool,
+    /// Block holding the batch, while that block may still become canonical.
+    included_in: Option<usize>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Round {
-    proposed_at: u64,
-    batches: Vec<usize>,
-    /// Aggregated OrderVotes at the next leader.
+    leader: usize,
+    /// Position of this round within the leader's turn.
+    pos: u64,
+    block: Option<usize>,
+    propose_scheduled: bool,
     votes: usize,
-    /// When the next leader formed the QC.
+    /// Whether the next round's leader is fixed.
+    resolved: bool,
+    via_tc: bool,
+    timeouts: Vec<usize>,
+    timed_out: Vec<bool>,
+    tc_formed: Vec<bool>,
+}
+
+#[derive(Debug)]
+struct Block {
+    round: u64,
+    leader: usize,
+    parent: usize,
+    height: u64,
+    batches: Vec<usize>,
+    proposed_at: u64,
+    bytes: u64,
+    after_tc: bool,
+    exec_cost: f64,
     qc_at: Option<u64>,
-    /// When each validator verified the proposal.
     known_at: Vec<Option<u64>>,
-    /// When each validator committed this block.
     committed_at: Vec<Option<u64>>,
     executed_at: Vec<Option<u64>>,
+    exec_voted: Vec<bool>,
     exec_votes: Vec<usize>,
     cert_at: Vec<Option<u64>>,
-    exec_cost: Option<f64>,
 }
 
 struct State<'a, 'e> {
@@ -103,24 +139,27 @@ struct State<'a, 'e> {
     net: Network,
     engine: ExecEngine,
     batches: Vec<Batch>,
-    /// Batches with a PoA that no proposal has included yet.
+    /// Batches with a PoA that no live block holds.
     open_poas: Vec<usize>,
-    /// Pending transactions per owner, sorted by arrival at the owner.
+    /// Pending transactions per batching validator, sorted by when it may batch them.
     owner_queue: Vec<Vec<(u64, usize)>>,
     owner_next: Vec<usize>,
     rounds: Vec<Round>,
-    /// Highest round whose proposal has been scheduled.
-    scheduled: u64,
-    /// Next block to execute on the shared engine.
-    engine_next: u64,
-    /// Next block each validator has to execute.
-    exec_next: Vec<u64>,
-    /// Whether a validator has an execution scheduled or running.
+    blocks: Vec<Block>,
+    blocks_at_height: Vec<Vec<usize>>,
+    /// Canonical chain by height, as first committed by any validator.
+    chain: Vec<usize>,
+    cur_round: Vec<u64>,
+    last_voted: Vec<u64>,
+    high_qc: Vec<usize>,
+    consecutive_timeouts: Vec<u32>,
+    committed_height: Vec<u64>,
+    /// Blocks each validator has executed, by height, along its current branch.
+    exec_chain: Vec<Vec<usize>>,
     exec_busy: Vec<bool>,
-    /// Highest committed block per validator.
-    committed_upto: Vec<u64>,
-    /// Highest round up to which a validator has verified every proposal.
-    known_upto: Vec<u64>,
+    engine_next: u64,
+    tcs: Vec<u64>,
+    safe: bool,
     failed_txs: usize,
 }
 
@@ -134,7 +173,13 @@ pub fn run(env: &Env<'_>) -> Report {
     let mut owner_queue: Vec<Vec<(u64, usize)>> = vec![Vec::new(); n];
     for (i, tx) in env.workload.txs.iter().enumerate() {
         let owner = owner_of(tx, n);
-        owner_queue[owner].push((env.workload.arrival_at(i, owner, env.topo), i));
+        if cfg.is_up(owner) {
+            owner_queue[owner].push((env.workload.arrival_at(i, owner, env.topo), i));
+        } else {
+            let fallback = (1..n).map(|d| (owner + d) % n).find(|&v| cfg.is_up(v)).expect("up");
+            let at = env.workload.arrival_at(i, fallback, env.topo) + cfg.fallback_ms * 1000;
+            owner_queue[fallback].push((at, i));
+        }
     }
     for q in &mut owner_queue {
         q.sort_unstable();
@@ -145,34 +190,52 @@ pub fn run(env: &Env<'_>) -> Report {
         n,
         q: EventQueue::default(),
         cpu: Cpu::new(n, cfg.sig_cores, window),
-        net: Network::new(n, cfg.bandwidth_mbps, window.0),
+        net: Network::new(
+            n,
+            cfg.bandwidth_mbps,
+            window.0,
+            (cfg.jitter_ms * 1000.0) as u64,
+            cfg.seed,
+        ),
         engine: ExecEngine::new(env.workload.accounts),
         batches: Vec::new(),
         open_poas: Vec::new(),
         owner_queue,
         owner_next: vec![0; n],
-        rounds: vec![Round::default()],
-        scheduled: 0,
-        engine_next: 1,
-        exec_next: vec![1; n],
+        rounds: Vec::new(),
+        blocks: Vec::new(),
+        blocks_at_height: vec![vec![0]],
+        chain: vec![0],
+        cur_round: vec![0; n],
+        last_voted: vec![0; n],
+        high_qc: vec![0; n],
+        consecutive_timeouts: vec![0; n],
+        committed_height: vec![0; n],
+        exec_chain: vec![vec![0]; n],
         exec_busy: vec![false; n],
-        committed_upto: vec![0; n],
-        known_upto: vec![0; n],
+        engine_next: 1,
+        tcs: Vec::new(),
+        safe: true,
         failed_txs: 0,
     };
-    // Genesis: round 0 is certified, committed, executed and has an ExecCert everywhere.
-    s.rounds[0] = s.new_round(0);
-    s.rounds[0].qc_at = Some(0);
-    s.rounds[0].known_at = vec![Some(0); n];
-    s.rounds[0].committed_at = vec![Some(0); n];
-    s.rounds[0].executed_at = vec![Some(0); n];
-    s.rounds[0].cert_at = vec![Some(0); n];
+    // Genesis: round 0 and block 0 are certified, committed, executed and have an ExecCert.
+    let mut genesis_round = s.new_round(n - 1, cfg.turn_length - 1);
+    genesis_round.resolved = true;
+    s.rounds.push(genesis_round);
+    s.rounds.push(s.new_round(0, 0));
+    let mut genesis = s.new_block(0, 0, 0, 0, 0);
+    genesis.qc_at = Some(0);
+    genesis.known_at = vec![Some(0); n];
+    genesis.committed_at = vec![Some(0); n];
+    genesis.executed_at = vec![Some(0); n];
+    genesis.cert_at = vec![Some(0); n];
+    s.blocks.push(genesis);
 
     let t_batch = cfg.t_batch_ms * 1000;
-    for v in 0..n {
+    for v in (0..n).filter(|&v| cfg.is_up(v)) {
         s.q.push(t_batch * v as u64 / n as u64, Event::BatchTick(v));
+        s.enter_round(v, 1, 0);
     }
-    s.try_propose(1);
 
     while let Some((now, ev)) = s.q.pop() {
         if now > end {
@@ -193,20 +256,66 @@ fn owner_of(tx: &Tx, n: usize) -> usize {
 }
 
 impl State<'_, '_> {
-    fn new_round(&self, proposed_at: u64) -> Round {
+    fn new_round(&self, leader: usize, pos: u64) -> Round {
         Round {
-            proposed_at,
-            known_at: vec![None; self.n],
-            committed_at: vec![None; self.n],
-            executed_at: vec![None; self.n],
-            exec_votes: vec![0; self.n],
-            cert_at: vec![None; self.n],
-            ..Default::default()
+            leader,
+            pos,
+            block: None,
+            propose_scheduled: false,
+            votes: 0,
+            resolved: false,
+            via_tc: false,
+            timeouts: vec![0; self.n],
+            timed_out: vec![false; self.n],
+            tc_formed: vec![false; self.n],
         }
     }
 
-    fn leader(&self, r: u64) -> usize {
-        ((r / self.env.cfg.turn_length) as usize) % self.n
+    fn new_block(&self, round: u64, leader: usize, parent: usize, height: u64, at: u64) -> Block {
+        Block {
+            round,
+            leader,
+            parent,
+            height,
+            batches: Vec::new(),
+            proposed_at: at,
+            bytes: 0,
+            after_tc: false,
+            exec_cost: 0.0,
+            qc_at: None,
+            known_at: vec![None; self.n],
+            committed_at: vec![None; self.n],
+            executed_at: vec![None; self.n],
+            exec_voted: vec![false; self.n],
+            exec_votes: vec![0; self.n],
+            cert_at: vec![None; self.n],
+        }
+    }
+
+    /// Leader and turn position of the round after `r`. A TC skips the rest of the turn.
+    fn leader_after(&self, r: u64, via_tc: bool) -> (usize, u64) {
+        let round = &self.rounds[r as usize];
+        if via_tc || round.pos + 1 >= self.env.cfg.turn_length {
+            ((round.leader + 1) % self.n, 0)
+        } else {
+            (round.leader, round.pos + 1)
+        }
+    }
+
+    /// Fixes the leader of round `r + 1` from how round `r` ended.
+    fn resolve(&mut self, r: u64, via_tc: bool, at: u64) {
+        if self.rounds[r as usize].resolved {
+            return;
+        }
+        let (leader, pos) = self.leader_after(r, via_tc);
+        let round = &mut self.rounds[r as usize];
+        round.resolved = true;
+        round.via_tc = via_tc;
+        if via_tc {
+            self.tcs.push(at);
+        }
+        let next = self.new_round(leader, pos);
+        self.rounds.push(next);
     }
 
     fn handle(&mut self, now: u64, ev: Event) {
@@ -218,6 +327,9 @@ impl State<'_, '_> {
                 self.q.push(now + cfg.t_batch_ms * 1000, Event::BatchTick(v));
             }
             Event::BatchArrive { v, b } => {
+                if !cfg.is_up(v) {
+                    return;
+                }
                 let batch = &mut self.batches[b];
                 batch.body_at[v] = Some(now);
                 let verified = self.cpu.sig(v, now, crypto.ed_verify_batched);
@@ -232,32 +344,61 @@ impl State<'_, '_> {
             }
             Event::Ack(b) => self.on_ack(now, b),
             Event::Poa { v, b } => {
-                if self.batches[b].poa_at[v].is_none() {
+                if cfg.is_up(v) && self.batches[b].poa_at[v].is_none() {
                     let verified = self.cpu.sig(v, now, crypto.bls_agg_verify);
                     self.batches[b].poa_at[v] = Some(verified);
                 }
             }
             Event::Propose(r) => self.propose(now, r),
-            Event::Proposal { v, r } => self.on_proposal(now, v, r),
-            Event::Vote(r) => {
-                let next = self.leader(r + 1);
-                let done = self.cpu.sig(next, now, crypto.bls_agg_add);
-                self.add_order_vote(next, r, done);
-            }
-            Event::ExecReady { v, r } => self.execute(now, v, r),
-            Event::Executed { v, r } => {
-                self.rounds[r as usize].executed_at[v] = Some(now);
-                // A speculatively executed block is only voted on once it is committed.
-                if self.committed_upto[v] >= r {
-                    self.send_exec_vote(v, r, now);
+            Event::Proposal { v, blk } => self.on_proposal(now, v, blk),
+            Event::Vote { to, r } => {
+                if cfg.is_up(to) {
+                    let done = self.cpu.sig(to, now, crypto.bls_agg_add);
+                    self.add_order_vote(to, r, done);
                 }
-                self.exec_next[v] = r + 1;
+            }
+            Event::Qc { v, r } => {
+                if cfg.is_up(v) {
+                    let done = self.cpu.sig(v, now, crypto.bls_agg_verify);
+                    let blk = self.rounds[r as usize].block.expect("a QC certifies a proposal");
+                    self.on_qc(v, blk, done);
+                    self.enter_round(v, r + 1, done);
+                }
+            }
+            Event::Timer { v, r } => {
+                if self.cur_round[v] == r && !self.rounds[r as usize].timed_out[v] {
+                    self.local_timeout(v, r, now);
+                }
+            }
+            Event::Timeout { v, r, high_qc } => {
+                if cfg.is_up(v) {
+                    // The signature plus the carried QC.
+                    let done = self.cpu.sig(v, now, crypto.bls_agg_add + crypto.bls_agg_verify);
+                    self.on_qc(v, high_qc, done);
+                    self.on_timeout(v, r, done);
+                }
+            }
+            Event::ExecReady { v, blk } => self.execute(now, v, blk),
+            Event::Executed { v, blk } => {
                 self.exec_busy[v] = false;
+                let parent = self.blocks[blk].parent;
+                if self.exec_chain[v].last() == Some(&parent) {
+                    self.exec_chain[v].push(blk);
+                    self.blocks[blk].executed_at[v] = Some(now);
+                    if self.blocks[blk].committed_at[v].is_some() {
+                        self.send_exec_vote(v, blk, now);
+                    }
+                }
                 self.schedule_exec(now, v);
             }
-            Event::ExecVote { v, r } => {
-                let done = self.cpu.sig(v, now, crypto.bls_agg_add);
-                self.add_exec_vote(v, r, done);
+            Event::ExecVote { v, from, blk } => {
+                if cfg.is_up(v) {
+                    let done = self.cpu.sig(v, now, crypto.bls_agg_add);
+                    // A wrong state root never matches the honest ExecVotes.
+                    if cfg.is_honest(from) {
+                        self.add_exec_vote(v, blk, done);
+                    }
+                }
             }
         }
     }
@@ -297,7 +438,7 @@ impl State<'_, '_> {
                 body_at: vec![None; self.n],
                 stored_at: vec![None; self.n],
                 poa_at: vec![None; self.n],
-                included: false,
+                included_in: None,
             };
             batch.body_at[v] = Some(signed);
             batch.stored_at[v] = Some(signed);
@@ -328,245 +469,397 @@ impl State<'_, '_> {
         }
     }
 
-    /// Schedules the proposal of round `r` once its leader has the QC of `r - 1`, the ExecCert
-    /// of `r - k`, and `T_minInterval` has passed since the parent proposal.
-    fn try_propose(&mut self, r: u64) {
-        if r != self.scheduled + 1 {
+    /// Validator `v` moves to round `r` and arms its timer.
+    fn enter_round(&mut self, v: usize, r: u64, at: u64) {
+        if r <= self.cur_round[v] {
             return;
         }
+        self.cur_round[v] = r;
+        let exp = self.consecutive_timeouts[v].min(MAX_BACKOFF_EXP);
+        let timeout = self.env.cfg.round_timeout_ms * 1000 * (1u64 << exp);
+        // The timer guards the leader, so it counts from the earliest moment the leader may
+        // propose: `T_minInterval` after the parent proposal. Otherwise a `T_minInterval` above
+        // `T_base` would time out every round.
+        let earliest =
+            self.blocks[self.high_qc[v]].proposed_at + self.env.cfg.min_interval_ms * 1000;
+        self.q.push(at.max(earliest) + timeout, Event::Timer { v, r });
+        if self.rounds[r as usize].leader == v {
+            self.try_propose(r, at);
+        }
+    }
+
+    /// Schedules the leader's proposal for round `r` once `T_minInterval` has passed since the
+    /// parent proposal and the leader holds the ExecCert of height `h - k`.
+    fn try_propose(&mut self, r: u64, now: u64) {
         let cfg = self.env.cfg;
-        let leader = self.leader(r);
-        let Some(parent) = self.rounds.get(r as usize - 1) else { return };
-        let Some(qc) = parent.qc_at else { return };
-        let mut at = qc.max(parent.proposed_at + cfg.min_interval_ms * 1000);
-        if r > cfg.exec_lag {
-            let certified = (r - cfg.exec_lag) as usize;
-            match self.rounds.get(certified).and_then(|round| round.cert_at[leader]) {
+        let round = &self.rounds[r as usize];
+        let leader = round.leader;
+        if !cfg.is_up(leader) || round.propose_scheduled || self.cur_round[leader] != r {
+            return;
+        }
+        let parent = self.high_qc[leader];
+        let height = self.blocks[parent].height + 1;
+        let mut at = now.max(self.blocks[parent].proposed_at + cfg.min_interval_ms * 1000);
+        if height > cfg.exec_lag {
+            let mut ancestor = parent;
+            while self.blocks[ancestor].height > height - cfg.exec_lag {
+                ancestor = self.blocks[ancestor].parent;
+            }
+            match self.blocks[ancestor].cert_at[leader] {
                 Some(cert) => at = at.max(cert),
+                // Retried when the ExecCert forms at the leader.
                 None => return,
             }
         }
-        self.scheduled = r;
+        self.rounds[r as usize].propose_scheduled = true;
         self.q.push(at, Event::Propose(r));
     }
 
     fn propose(&mut self, now: u64, r: u64) {
         let cfg = self.env.cfg;
         let crypto = self.env.crypto;
-        let leader = self.leader(r);
+        let leader = self.rounds[r as usize].leader;
+        if self.cur_round[leader] != r {
+            return;
+        }
+        let parent = self.high_qc[leader];
+        let height = self.blocks[parent].height + 1;
         let mut gas = 0;
         let mut chosen = Vec::new();
         let mut remaining = Vec::with_capacity(self.open_poas.len());
         for &b in &self.open_poas {
             let batch = &self.batches[b];
             let known = batch.poa_at[leader].is_some_and(|t| t <= now);
-            if known && gas + batch.gas <= cfg.gas_limit {
+            if known && batch.included_in.is_none() && gas + batch.gas <= cfg.gas_limit {
                 gas += batch.gas;
                 chosen.push(b);
-            } else {
+            } else if batch.included_in.is_none() {
                 remaining.push(b);
             }
         }
         self.open_poas = remaining;
+        let id = self.blocks.len();
         for &b in &chosen {
-            self.batches[b].included = true;
+            self.batches[b].included_in = Some(id);
         }
-        let mut round = self.new_round(now);
-        round.batches = chosen;
-        let bytes = PROPOSAL_HEADER_BYTES + round.batches.len() as u64 * POA_BYTES;
-        self.rounds.push(round);
+        let after_tc = self.rounds[r as usize - 1].via_tc;
+        let mut block = self.new_block(r, leader, parent, height, now);
+        block.exec_cost = self.env.exec_model.cost_of(
+            chosen
+                .iter()
+                .flat_map(|&b| self.batches[b].txs.iter().map(|&i| &self.env.workload.txs[i])),
+        );
+        block.bytes = PROPOSAL_HEADER_BYTES +
+            chosen.len() as u64 * POA_BYTES +
+            if after_tc { TC_BYTES } else { 0 };
+        block.after_tc = after_tc;
+        block.batches = chosen;
+        let bytes = block.bytes;
+        self.blocks.push(block);
+        if self.blocks_at_height.len() <= height as usize {
+            self.blocks_at_height.push(Vec::new());
+        }
+        self.blocks_at_height[height as usize].push(id);
+        self.rounds[r as usize].block = Some(id);
         let signed = self.cpu.sig(leader, now, crypto.bls_sign);
         for (v, at) in self.net.broadcast(self.env.topo, signed, leader, bytes) {
-            self.q.push(at, Event::Proposal { v, r });
+            self.q.push(at, Event::Proposal { v, blk: id });
         }
-        self.record_proposal(leader, r, signed);
+        self.blocks[id].known_at[leader] = Some(signed);
         self.vote(leader, r, signed);
+        self.schedule_exec(signed, leader);
     }
 
-    fn on_proposal(&mut self, now: u64, v: usize, r: u64) {
+    fn on_proposal(&mut self, now: u64, v: usize, blk: usize) {
         let crypto = self.env.crypto;
         let cfg = self.env.cfg;
-        // Header signature, parent QC and the carried ExecCert.
+        if !cfg.is_up(v) {
+            return;
+        }
+        // Header signature, parent QC, the carried ExecCert and TC.
+        let block = &self.blocks[blk];
         let mut cost = crypto.bls_verify + crypto.bls_agg_verify;
-        if r > cfg.exec_lag {
+        if block.height > cfg.exec_lag {
+            cost += crypto.bls_agg_verify;
+        }
+        if block.after_tc {
             cost += crypto.bls_agg_verify;
         }
         let checked = self.cpu.sig(v, now, cost);
         // PoAs not yet in the cache are verified once, in parallel.
-        let mut unseen = 0usize;
-        for &b in &self.rounds[r as usize].batches {
-            if self.batches[b].poa_at[v].is_none_or(|t| t > now) {
-                unseen += 1;
-            }
-        }
+        let unseen = block
+            .batches
+            .iter()
+            .filter(|&&b| self.batches[b].poa_at[v].is_none_or(|t| t > now))
+            .count();
         let verified =
             self.cpu.parallel(v, checked, unseen as f64 * crypto.bls_agg_verify).max(checked);
-        for i in 0..self.rounds[r as usize].batches.len() {
-            let b = self.rounds[r as usize].batches[i];
+        for i in 0..self.blocks[blk].batches.len() {
+            let b = self.blocks[blk].batches[i];
             if self.batches[b].poa_at[v].is_none_or(|t| t > verified) {
                 self.batches[b].poa_at[v] = Some(verified);
             }
         }
-        self.record_proposal(v, r, verified);
-        // The proposal carries QC(r - 1), which commits r - 2.
-        if r >= 2 {
-            self.commit(v, r - 2, verified);
+        self.blocks[blk].known_at[v] = Some(verified);
+        let parent = self.blocks[blk].parent;
+        self.on_qc(v, parent, verified);
+        let r = self.blocks[blk].round;
+        if self.rounds[r as usize - 1].via_tc {
+            self.enter_round(v, r, verified);
         }
-        self.vote(v, r, verified);
+        self.enter_round(v, r, verified);
+        if self.cur_round[v] == r && r > self.last_voted[v] {
+            self.vote(v, r, verified);
+        }
+        self.schedule_exec(verified, v);
+    }
+
+    /// Validator `v` learns at `at` that block `blk` is certified.
+    fn on_qc(&mut self, v: usize, blk: usize, at: u64) {
+        if self.blocks[blk].round > self.blocks[self.high_qc[v]].round {
+            self.high_qc[v] = blk;
+            self.consecutive_timeouts[v] = 0;
+        }
+        // Two-chain rule: a certified block from the round right after its parent commits the
+        // parent.
+        let parent = self.blocks[blk].parent;
+        if blk != 0 && self.blocks[parent].round + 1 == self.blocks[blk].round {
+            self.commit(v, parent, at);
+        }
     }
 
     fn vote(&mut self, v: usize, r: u64, ready: u64) {
+        self.last_voted[v] = r;
         let signed = self.cpu.sig(v, ready, self.env.crypto.bls_sign);
-        let next = self.leader(r + 1);
-        if v == next {
-            self.add_order_vote(next, r, signed);
+        let to = if self.rounds[r as usize].resolved {
+            self.rounds[r as usize + 1].leader
         } else {
-            for (_, at) in self.net.send(self.env.topo, signed, v, &[next], VOTE_BYTES) {
-                self.q.push(at, Event::Vote(r));
+            self.leader_after(r, false).0
+        };
+        if v == to {
+            self.add_order_vote(to, r, signed);
+        } else {
+            for (_, at) in self.net.send(self.env.topo, signed, v, &[to], VOTE_BYTES) {
+                self.q.push(at, Event::Vote { to, r });
             }
         }
     }
 
-    fn add_order_vote(&mut self, next: usize, r: u64, at: u64) {
+    fn add_order_vote(&mut self, to: usize, r: u64, at: u64) {
         let quorum = self.env.cfg.quorum();
         let round = &mut self.rounds[r as usize];
         round.votes += 1;
         if round.votes != quorum {
             return;
         }
-        let qc = self.cpu.sig(next, at, self.env.crypto.bls_agg_verify);
-        self.rounds[r as usize].qc_at = Some(qc);
-        // QC(r) at the next leader commits r - 1.
-        if r >= 1 {
-            self.commit(next, r - 1, qc);
+        let blk = round.block.expect("votes are for a proposal");
+        let qc = self.cpu.sig(to, at, self.env.crypto.bls_agg_verify);
+        self.blocks[blk].qc_at = Some(qc);
+        self.on_qc(to, blk, qc);
+        self.resolve(r, false, qc);
+        if self.env.cfg.qc_broadcast {
+            for (v, at) in self.net.broadcast(self.env.topo, qc, to, QC_BYTES) {
+                self.q.push(at, Event::Qc { v, r });
+            }
         }
-        self.try_propose(r + 1);
+        self.enter_round(to, r + 1, qc);
     }
 
-    /// Validator `v` learns at `at` that blocks up to `r` are committed.
-    fn commit(&mut self, v: usize, r: u64, at: u64) {
-        while self.committed_upto[v] < r {
-            self.committed_upto[v] += 1;
-            let c = self.committed_upto[v];
-            self.rounds[c as usize].committed_at[v] = Some(at);
-            if self.rounds[c as usize].executed_at[v].is_some() {
-                self.send_exec_vote(v, c, at);
+    fn local_timeout(&mut self, v: usize, r: u64, at: u64) {
+        self.rounds[r as usize].timed_out[v] = true;
+        self.last_voted[v] = self.last_voted[v].max(r);
+        self.consecutive_timeouts[v] += 1;
+        let signed = self.cpu.sig(v, at, self.env.crypto.bls_sign);
+        for (u, t) in self.net.broadcast(self.env.topo, signed, v, VOTE_BYTES + QC_BYTES) {
+            self.q.push(t, Event::Timeout { v: u, r, high_qc: self.high_qc[v] });
+        }
+        self.on_timeout(v, r, signed);
+    }
+
+    fn on_timeout(&mut self, v: usize, r: u64, at: u64) {
+        let cfg = self.env.cfg;
+        let round = &mut self.rounds[r as usize];
+        round.timeouts[v] += 1;
+        let count = round.timeouts[v];
+        // f + 1 timeouts mean at least one honest validator gave up on the round.
+        if count == cfg.f() + 1 && self.cur_round[v] == r && !round.timed_out[v] {
+            self.local_timeout(v, r, at);
+        }
+        let round = &mut self.rounds[r as usize];
+        if count == cfg.quorum() && !round.tc_formed[v] {
+            round.tc_formed[v] = true;
+            let tc = self.cpu.sig(v, at, self.env.crypto.bls_agg_verify);
+            self.resolve(r, true, tc);
+            self.enter_round(v, r + 1, tc);
+        }
+    }
+
+    /// Validator `v` learns at `at` that `blk` and its ancestors are committed.
+    fn commit(&mut self, v: usize, blk: usize, at: u64) {
+        let mut path = Vec::new();
+        let mut cur = blk;
+        while self.blocks[cur].committed_at[v].is_none() {
+            path.push(cur);
+            cur = self.blocks[cur].parent;
+        }
+        for &x in path.iter().rev() {
+            self.blocks[x].committed_at[v] = Some(at);
+            let height = self.blocks[x].height;
+            self.committed_height[v] = self.committed_height[v].max(height);
+            if self.chain.len() as u64 == height {
+                self.on_canonical(x);
+            } else if self.chain[height as usize] != x {
+                self.safe = false;
+            }
+            // Roll back speculation that took another branch.
+            let exec = &mut self.exec_chain[v];
+            if exec.len() as u64 > height && exec[height as usize] != x {
+                exec.truncate(height as usize);
+            }
+            if self.blocks[x].executed_at[v].is_some() &&
+                self.exec_chain[v].get(height as usize) == Some(&x)
+            {
+                self.send_exec_vote(v, x, at);
             }
         }
         self.schedule_exec(at, v);
     }
 
-    fn send_exec_vote(&mut self, v: usize, r: u64, ready: u64) {
-        let signed = self.cpu.sig(v, ready, self.env.crypto.bls_sign);
-        self.add_exec_vote(v, r, signed);
-        for (u, at) in self.net.broadcast(self.env.topo, signed, v, VOTE_BYTES) {
-            self.q.push(at, Event::ExecVote { v: u, r });
-        }
-    }
-
-    /// Validator `v` has verified the proposal of round `r` at `at`.
-    fn record_proposal(&mut self, v: usize, r: u64, at: u64) {
-        self.rounds[r as usize].known_at[v] = Some(at);
-        while let Some(round) = self.rounds.get(self.known_upto[v] as usize + 1) {
-            if round.known_at[v].is_none() {
-                break;
+    /// Block `x` is the first committed block at its height.
+    fn on_canonical(&mut self, x: usize) {
+        let height = self.blocks[x].height as usize;
+        self.chain.push(x);
+        // Siblings can no longer be committed; their batches go back to the pool.
+        for i in 0..self.blocks_at_height[height].len() {
+            let sibling = self.blocks_at_height[height][i];
+            if sibling == x {
+                continue;
             }
-            self.known_upto[v] += 1;
-        }
-        self.schedule_exec(at, v);
-    }
-
-    /// Schedules execution of the next block once its batch bodies have arrived. Without
-    /// speculation only committed blocks run; with it, any verified proposal up to `D_spec`
-    /// blocks past the committed head.
-    fn schedule_exec(&mut self, now: u64, v: usize) {
-        let r = self.exec_next[v];
-        let limit = if self.env.cfg.speculative {
-            self.known_upto[v].min(self.committed_upto[v] + D_SPEC)
-        } else {
-            self.committed_upto[v]
-        };
-        if self.exec_busy[v] || r > limit {
-            return;
-        }
-        let round = &self.rounds[r as usize];
-        let known = round.committed_at[v].or(round.known_at[v]).expect("proposal verified");
-        let mut ready = known.max(now);
-        for &b in &round.batches {
-            // A missing body is still in flight (it was broadcast to everyone): poll for it.
-            ready = ready.max(self.batches[b].body_at[v].unwrap_or(now + BODY_POLL_US));
-        }
-        self.exec_busy[v] = true;
-        self.q.push(ready, Event::ExecReady { v, r });
-    }
-
-    fn execute(&mut self, now: u64, v: usize, r: u64) {
-        let mut ready = now;
-        for &b in &self.rounds[r as usize].batches {
-            match self.batches[b].stored_at[v] {
-                Some(t) => ready = ready.max(t),
-                None => {
-                    self.q.push(now + BODY_POLL_US, Event::ExecReady { v, r });
-                    return;
+            for j in 0..self.blocks[sibling].batches.len() {
+                let b = self.blocks[sibling].batches[j];
+                if self.batches[b].included_in == Some(sibling) {
+                    self.batches[b].included_in = None;
+                    self.open_poas.push(b);
                 }
             }
         }
-        let cost = self.exec_cost(r);
-        let done = self.cpu.exec(v, ready, cost);
-        self.q.push(done, Event::Executed { v, r });
-    }
-
-    /// Executes blocks on the shared engine up to `r` and returns the cost of block `r`.
-    fn exec_cost(&mut self, r: u64) -> f64 {
-        while self.engine_next <= r {
-            let x = self.engine_next as usize;
+        // Execute canonical blocks for real, in order, so gas and failures are real.
+        while (self.engine_next as usize) < self.chain.len() {
+            let blk = self.chain[self.engine_next as usize];
             let txs = &self.env.workload.txs;
-            let order: Vec<usize> = self.rounds[x]
+            let order: Vec<usize> = self.blocks[blk]
                 .batches
                 .iter()
                 .flat_map(|&b| self.batches[b].txs.iter().copied())
                 .collect();
             let res = self.engine.execute(order.iter().map(|&i| &txs[i]));
             self.failed_txs += res.failed;
-            self.rounds[x].exec_cost = Some(self.env.exec_model.block_cost(&res));
             self.engine_next += 1;
         }
-        self.rounds[r as usize].exec_cost.expect("executed above")
     }
 
-    fn add_exec_vote(&mut self, v: usize, r: u64, at: u64) {
-        let quorum = self.env.cfg.quorum();
-        let round = &mut self.rounds[r as usize];
-        round.exec_votes[v] += 1;
-        if round.exec_votes[v] != quorum {
+    fn send_exec_vote(&mut self, v: usize, blk: usize, ready: u64) {
+        if self.blocks[blk].exec_voted[v] {
+            return;
+        }
+        self.blocks[blk].exec_voted[v] = true;
+        let signed = self.cpu.sig(v, ready, self.env.crypto.bls_sign);
+        if self.env.cfg.is_honest(v) {
+            self.add_exec_vote(v, blk, signed);
+        }
+        for (u, at) in self.net.broadcast(self.env.topo, signed, v, VOTE_BYTES) {
+            self.q.push(at, Event::ExecVote { v: u, from: v, blk });
+        }
+    }
+
+    /// Schedules execution of the next block on `v`'s branch: the committed block at the next
+    /// height, or with speculation a verified proposal extending the branch, at most `D_spec`
+    /// blocks past the committed head.
+    fn schedule_exec(&mut self, now: u64, v: usize) {
+        if self.exec_busy[v] {
+            return;
+        }
+        let height = self.exec_chain[v].len() as u64;
+        let tip = *self.exec_chain[v].last().expect("genesis");
+        let next = if self.committed_height[v] >= height {
+            Some(self.chain[height as usize])
+        } else if self.env.cfg.speculative && height <= self.committed_height[v] + D_SPEC {
+            self.blocks_at_height
+                .get(height as usize)
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(|&b| self.blocks[b].parent == tip && self.blocks[b].known_at[v].is_some())
+                .max_by_key(|&b| self.blocks[b].round)
+        } else {
+            None
+        };
+        let Some(blk) = next else { return };
+        let block = &self.blocks[blk];
+        let known = block.committed_at[v].or(block.known_at[v]).expect("known or committed");
+        let mut ready = known.max(now);
+        for &b in &block.batches {
+            // A missing body is still in flight (it was broadcast to everyone): poll for it.
+            ready = ready.max(self.batches[b].body_at[v].unwrap_or(now + BODY_POLL_US));
+        }
+        self.exec_busy[v] = true;
+        self.q.push(ready, Event::ExecReady { v, blk });
+    }
+
+    fn execute(&mut self, now: u64, v: usize, blk: usize) {
+        if self.exec_chain[v].last() != Some(&self.blocks[blk].parent) {
+            self.exec_busy[v] = false;
+            self.schedule_exec(now, v);
+            return;
+        }
+        let mut ready = now;
+        for &b in &self.blocks[blk].batches {
+            match self.batches[b].stored_at[v] {
+                Some(t) => ready = ready.max(t),
+                None => {
+                    self.q.push(now + BODY_POLL_US, Event::ExecReady { v, blk });
+                    return;
+                }
+            }
+        }
+        let done = self.cpu.exec(v, ready, self.blocks[blk].exec_cost);
+        self.q.push(done, Event::Executed { v, blk });
+    }
+
+    fn add_exec_vote(&mut self, v: usize, blk: usize, at: u64) {
+        let block = &mut self.blocks[blk];
+        block.exec_votes[v] += 1;
+        if block.exec_votes[v] != self.env.cfg.quorum() {
             return;
         }
         let cert = self.cpu.sig(v, at, self.env.crypto.bls_agg_verify);
-        self.rounds[r as usize].cert_at[v] = Some(cert);
-        let next = r + self.env.cfg.exec_lag;
-        if self.leader(next) == v {
-            self.try_propose(next);
+        self.blocks[blk].cert_at[v] = Some(cert);
+        // A leader held back by the missing ExecCert can propose now.
+        let r = self.cur_round[v];
+        if self.rounds[r as usize].leader == v {
+            self.try_propose(r, cert);
         }
     }
 
     fn finish(self) -> Report {
         let cfg = self.env.cfg;
         let txs = &self.env.workload.txs;
-        let mut times = TxTimes::new(txs.len());
-        let all = |col: &[Option<u64>]| -> Option<u64> {
-            let t: Vec<u64> = col.iter().flatten().copied().collect();
-            if t.len() < self.n {
+        let honest: Vec<usize> = (0..self.n).filter(|&v| cfg.is_honest(v)).collect();
+        let at_median = |col: &[Option<u64>]| -> Option<u64> {
+            let t: Vec<u64> = honest.iter().filter_map(|&v| col[v]).collect();
+            if t.len() < honest.len() {
                 None
             } else {
                 median(t)
             }
         };
-        let mut batch_wait = Vec::new();
-        for round in self.rounds.iter().skip(1) {
-            let ordered = all(&round.committed_at);
-            let executed = all(&round.executed_at);
-            let finalized = all(&round.cert_at);
-            for &b in &round.batches {
+        let mut times = TxTimes::new(txs.len());
+        for &blk in self.chain.iter().skip(1) {
+            let block = &self.blocks[blk];
+            let ordered = at_median(&block.committed_at);
+            let executed = at_median(&block.executed_at);
+            let finalized = at_median(&block.cert_at);
+            for &b in &block.batches {
                 for &i in &self.batches[b].txs {
                     times.ordered[i] = ordered;
                     times.executed[i] = executed;
@@ -574,35 +867,91 @@ impl State<'_, '_> {
                 }
             }
         }
-        for batch in &self.batches {
-            if let Some(formed) = batch.poa_at[batch.author] {
-                if let Some(signed) = batch.body_at[batch.author] {
-                    batch_wait.push(formed - signed);
-                }
-            }
-        }
-        let block_times: Vec<u64> = self.rounds.iter().skip(1).map(|r| r.proposed_at).collect();
-        let proposals = self.rounds.len().saturating_sub(1).max(1);
-        let mean_poas = self.rounds.iter().skip(1).map(|r| r.batches.len()).sum::<usize>() as f64 /
-            proposals as f64;
+
         let window = ((cfg.warmup_s * 1e6) as u64, (cfg.duration_s * 1e6) as u64);
-        let executed: Vec<f64> = self
-            .rounds
+        let window_s = (window.1 - window.0) as f64 / 1e6;
+        let in_window = |t: u64| t >= window.0 && t < window.1;
+        let canonical: Vec<&Block> = self
+            .chain
             .iter()
             .skip(1)
-            .filter(|r| r.proposed_at >= window.0 && r.proposed_at < window.1)
-            .filter_map(|r| r.exec_cost)
+            .map(|&b| &self.blocks[b])
+            .filter(|b| in_window(b.proposed_at))
             .collect();
-        let mean_exec = executed.iter().sum::<f64>() / executed.len().max(1) as f64;
+        let mut gaps = Vec::new();
+        let mut qcs = Vec::new();
+        let mut sigs = Vec::new();
+        let mut irreversible = Vec::new();
+        for b in &canonical {
+            if let Some(lead) = b.executed_at[b.leader] {
+                for &v in honest.iter().filter(|&&v| v != b.leader) {
+                    if let Some(t) = b.executed_at[v] {
+                        gaps.push(t.saturating_sub(lead));
+                    }
+                }
+            }
+            if let Some(qc) = b.qc_at {
+                qcs.push(qc - b.proposed_at);
+            }
+            if let Some(cert) = at_median(&b.cert_at) {
+                sigs.push(cert - b.proposed_at);
+            }
+            let both: Vec<u64> = honest
+                .iter()
+                .filter_map(|&v| Some(b.committed_at[v]?.max(b.cert_at[v]?)))
+                .collect();
+            if both.len() == honest.len() {
+                irreversible.push(median(both).expect("non-empty") - b.proposed_at);
+            }
+        }
+        let proposals: Vec<u64> = self
+            .blocks
+            .iter()
+            .skip(1)
+            .filter(|b| in_window(b.proposed_at))
+            .map(|b| b.bytes)
+            .collect();
+        let block = BlockStats {
+            blocks_per_s: canonical.len() as f64 / window_s,
+            tps: canonical
+                .iter()
+                .flat_map(|b| b.batches.iter())
+                .map(|&b| self.batches[b].txs.len())
+                .sum::<usize>() as f64 /
+                window_s,
+            critical_bytes: proposals.iter().sum::<u64>() as f64 / proposals.len().max(1) as f64,
+            state_gap_p50_ms: percentile_ms(&mut gaps, 0.5),
+            quorum_sig_p50_ms: percentile_ms(&mut sigs, 0.5),
+            order_qc_p50_ms: percentile_ms(&mut qcs, 0.5),
+            irreversible_p50_ms: percentile_ms(&mut irreversible.clone(), 0.5),
+            irreversible_p99_ms: percentile_ms(&mut irreversible, 0.99),
+            faults: self.tcs.iter().filter(|&&t| in_window(t)).count(),
+            safe: self.safe,
+        };
+
+        let mut batch_wait = Vec::new();
+        for batch in &self.batches {
+            if let (Some(formed), Some(signed)) =
+                (batch.poa_at[batch.author], batch.body_at[batch.author])
+            {
+                batch_wait.push(formed - signed);
+            }
+        }
+        let block_times: Vec<u64> =
+            self.chain.iter().skip(1).map(|&b| self.blocks[b].proposed_at).collect();
+        let mean_poas = canonical.iter().map(|b| b.batches.len()).sum::<usize>() as f64 /
+            canonical.len().max(1) as f64;
+        let mean_exec =
+            canonical.iter().map(|b| b.exec_cost).sum::<f64>() / canonical.len().max(1) as f64;
+        let orphaned = self.blocks.len() - self.chain.len();
         let poa_latency =
             median(batch_wait).map_or("-".into(), |t| format!("{:.1}", t as f64 / 1000.0));
-        let unproposed = self.open_poas.len();
         let extra = vec![
             ("batches".to_string(), self.batches.len().to_string()),
             ("PoAs per proposal (mean)".to_string(), format!("{mean_poas:.1}")),
             ("batch signed -> PoA, median (ms)".to_string(), poa_latency),
             ("mean block execution (ms)".to_string(), format!("{:.1}", mean_exec / 1000.0)),
-            ("PoAs never proposed".to_string(), unproposed.to_string()),
+            ("blocks not committed".to_string(), orphaned.to_string()),
             ("failed txs".to_string(), self.failed_txs.to_string()),
         ];
         Report::build(
@@ -614,6 +963,7 @@ impl State<'_, '_> {
                 block_times: &block_times,
                 cpu: &self.cpu,
                 net: &self.net,
+                block,
                 extra,
             },
         )

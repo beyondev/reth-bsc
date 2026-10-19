@@ -29,11 +29,20 @@ pub struct Topology {
     pub validator_region: Vec<usize>,
     /// One-way latency between validators in microseconds, with a fixed per-pair jitter.
     latency_us: Vec<Vec<u64>>,
+    /// Uniform latency replacing the region table, in microseconds.
+    uniform_us: Option<u64>,
 }
 
 impl Topology {
-    /// Places `n` validators round-robin over the weighted region list.
-    pub fn new(n: usize, seed: u64) -> Self {
+    /// Places `n` validators round-robin over the weighted region list, or puts every pair
+    /// `uniform_ms` apart when that is set.
+    pub fn new(n: usize, seed: u64, uniform_ms: Option<f64>) -> Self {
+        if let Some(ms) = uniform_ms {
+            let us = (ms * 1000.0) as u64;
+            let latency_us =
+                (0..n).map(|a| (0..n).map(|b| if a == b { 0 } else { us }).collect()).collect();
+            return Self { validator_region: vec![0; n], latency_us, uniform_us: Some(us) };
+        }
         let slots: Vec<usize> =
             REGIONS.iter().enumerate().flat_map(|(r, (_, w))| std::iter::repeat_n(r, *w)).collect();
         let validator_region: Vec<usize> = (0..n).map(|v| slots[v % slots.len()]).collect();
@@ -48,7 +57,7 @@ impl Topology {
                 latency_us[b][a] = us;
             }
         }
-        Self { validator_region, latency_us }
+        Self { validator_region, latency_us, uniform_us: None }
     }
 
     /// Number of regions.
@@ -63,7 +72,7 @@ impl Topology {
 
     /// One-way latency from a region (where a user submits) to a validator.
     pub fn region_latency_us(&self, region: usize, to: usize) -> u64 {
-        (LATENCY_MS[region][self.validator_region[to]] * 1000.0) as u64
+        self.uniform_us.unwrap_or((LATENCY_MS[region][self.validator_region[to]] * 1000.0) as u64)
     }
 }
 
@@ -78,16 +87,28 @@ pub struct Network {
     pub bytes_sent: Vec<u64>,
     /// Statistics start time; traffic before it is not counted.
     measure_from_us: u64,
+    /// Per-message jitter (plus or minus) in microseconds.
+    jitter_us: u64,
+    rng: ChaCha8Rng,
 }
 
 impl Network {
-    /// Creates idle links of `bandwidth_mbps` for `n` validators.
-    pub fn new(n: usize, bandwidth_mbps: f64, measure_from_us: u64) -> Self {
+    /// Creates idle links of `bandwidth_mbps` for `n` validators. Each message gets a random
+    /// extra delay in `[-jitter_us, +jitter_us]`.
+    pub fn new(
+        n: usize,
+        bandwidth_mbps: f64,
+        measure_from_us: u64,
+        jitter_us: u64,
+        seed: u64,
+    ) -> Self {
         Self {
             uplink_free: vec![0; n],
             bytes_per_us: bandwidth_mbps / 8.0,
             bytes_sent: vec![0; n],
             measure_from_us,
+            jitter_us,
+            rng: ChaCha8Rng::seed_from_u64(seed ^ 0x6a69_7474),
         }
     }
 
@@ -107,7 +128,12 @@ impl Network {
         let mut out = Vec::with_capacity(to.len());
         for &dst in to {
             t += per_copy;
-            out.push((dst, t as u64 + topology.latency_us(from, dst)));
+            let mut latency = topology.latency_us(from, dst) as i64;
+            if self.jitter_us > 0 {
+                let j = self.jitter_us as i64;
+                latency = (latency + self.rng.gen_range(-j..=j)).max(0);
+            }
+            out.push((dst, t as u64 + latency as u64));
         }
         self.uplink_free[from] = t as u64;
         if now >= self.measure_from_us {

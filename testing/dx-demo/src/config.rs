@@ -43,6 +43,22 @@ pub struct SimConfig {
     /// Random seed for the workload and the topology jitter.
     #[arg(long, default_value_t = 7)]
     pub seed: u64,
+    /// One-way latency between every pair of validators (and from users) in ms. Replaces the
+    /// five-region model when set.
+    #[arg(long)]
+    pub latency_ms: Option<f64>,
+    /// Per-message latency jitter (plus or minus) in ms, used with `--latency-ms`.
+    #[arg(long, default_value_t = 2.0)]
+    pub jitter_ms: f64,
+    /// Execution time of one block in ms at least; the measured cost is padded up to it.
+    #[arg(long)]
+    pub exec_block_ms: Option<f64>,
+    /// Validators that are down: they never propose, vote, ack or batch.
+    #[arg(long, value_delimiter = ',')]
+    pub crashed: Vec<usize>,
+    /// Validators whose execution produces a wrong state root.
+    #[arg(long, value_delimiter = ',')]
+    pub bad_exec: Vec<usize>,
 
     /// Parlia: block interval in milliseconds.
     #[arg(long, default_value_t = 450)]
@@ -60,6 +76,9 @@ pub struct SimConfig {
     /// sqrt(n) of them that relay it on.
     #[arg(long)]
     pub parlia_direct: bool,
+    /// Parlia: delay per backoff rank before another validator fills a missing in-turn block.
+    #[arg(long, default_value_t = 1000)]
+    pub backoff_ms: u64,
 
     /// DX: batch cut interval in milliseconds.
     #[arg(long, default_value_t = 100)]
@@ -77,6 +96,19 @@ pub struct SimConfig {
     /// still only signed for committed blocks.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub speculative: bool,
+    /// DX: base round timeout `T_base` in ms, counted from when the leader may propose; it
+    /// doubles with each consecutive timeout. It must exceed a proposal plus vote round trip,
+    /// about 230 ms in the default five-region placement.
+    #[arg(long, default_value_t = 1000)]
+    pub round_timeout_ms: u64,
+    /// DX: how long a down owner's transactions wait before another validator batches them
+    /// (`T_fallback`), in ms.
+    #[arg(long, default_value_t = 2000)]
+    pub fallback_ms: u64,
+    /// DX: the leader that forms a QC broadcasts it at once instead of only carrying it in its
+    /// next proposal, so validators commit one message hop earlier.
+    #[arg(long)]
+    pub qc_broadcast: bool,
 }
 
 impl SimConfig {
@@ -93,5 +125,15 @@ impl SimConfig {
     /// Availability threshold `f + 1` used for batch PoAs.
     pub const fn availability(&self) -> usize {
         self.f() + 1
+    }
+
+    /// Whether validator `v` is running.
+    pub fn is_up(&self, v: usize) -> bool {
+        !self.crashed.contains(&v)
+    }
+
+    /// Whether validator `v` is running and executes correctly.
+    pub fn is_honest(&self, v: usize) -> bool {
+        self.is_up(v) && !self.bad_exec.contains(&v)
     }
 }

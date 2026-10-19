@@ -64,6 +64,8 @@ pub struct ExecCostModel {
     pub erc20_us: f64,
     /// Fixed cost per block.
     pub block_us: f64,
+    /// A block never takes less than this to execute (`--exec-block-ms`).
+    pub min_block_us: f64,
     /// Cost measured with in-memory revm before scaling, for the report.
     pub measured_transfer_us: f64,
     /// Cost measured with in-memory revm before scaling, for the report.
@@ -109,6 +111,7 @@ impl ExecCostModel {
             transfer_us: transfer * scale,
             erc20_us: erc20 * scale,
             block_us: cfg.block_overhead_ms * 1000.0,
+            min_block_us: cfg.exec_block_ms.unwrap_or(0.0) * 1000.0,
             measured_transfer_us: transfer,
             measured_erc20_us: erc20,
         }
@@ -116,7 +119,23 @@ impl ExecCostModel {
 
     /// Cost of executing a block with the given composition.
     pub fn block_cost(&self, exec: &BlockExec) -> f64 {
-        self.block_us + exec.transfers as f64 * self.transfer_us + exec.erc20 as f64 * self.erc20_us
+        let cost = self.block_us +
+            exec.transfers as f64 * self.transfer_us +
+            exec.erc20 as f64 * self.erc20_us;
+        cost.max(self.min_block_us)
+    }
+
+    /// Cost of a block from its composition alone, for blocks that are never executed on the
+    /// shared engine (orphaned or rejected ones).
+    pub fn cost_of<'a>(&self, txs: impl Iterator<Item = &'a Tx>) -> f64 {
+        let mut exec = BlockExec::default();
+        for tx in txs {
+            match tx.kind {
+                TxKind::Transfer => exec.transfers += 1,
+                TxKind::Erc20 => exec.erc20 += 1,
+            }
+        }
+        self.block_cost(&exec)
     }
 }
 

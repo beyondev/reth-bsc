@@ -49,6 +49,44 @@ impl Latency {
     }
 }
 
+/// Block-level figures, measured from the moment a block leaves its proposer.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct BlockStats {
+    /// Canonical blocks per second in the window.
+    pub blocks_per_s: f64,
+    /// Transactions per second in those blocks.
+    pub tps: f64,
+    /// Mean bytes of the message on the critical path per block: the full block for Parlia,
+    /// the proposal for DX. Rejected and orphaned blocks count too.
+    pub critical_bytes: f64,
+    /// How much later an honest validator has the block's execution result than its proposer.
+    pub state_gap_p50_ms: f64,
+    /// Until 2/3 of the validators have signed the block's execution result at the median
+    /// honest validator (Parlia: votes, which cover the state root; DX: ExecCert).
+    pub quorum_sig_p50_ms: f64,
+    /// DX only: until the QC on the block's order forms at the next leader. NaN for Parlia.
+    pub order_qc_p50_ms: f64,
+    /// Until the block is irreversible at the median honest validator (Parlia: the block and
+    /// its child both have 2/3 votes; DX: committed and ExecCert).
+    pub irreversible_p50_ms: f64,
+    /// 99th percentile of the above.
+    pub irreversible_p99_ms: f64,
+    /// Parlia: blocks produced out of turn after a backoff. DX: rounds ended by a TC.
+    pub faults: usize,
+    /// Honest validators never committed different blocks at the same height, and every
+    /// ExecCert matches the honest execution result.
+    pub safe: bool,
+}
+
+/// Percentile `q` of `values` (microseconds) in milliseconds, NaN when empty.
+pub fn percentile_ms(values: &mut [u64], q: f64) -> f64 {
+    if values.is_empty() {
+        return f64::NAN;
+    }
+    values.sort_unstable();
+    values[((values.len() - 1) as f64 * q).round() as usize] as f64 / 1000.0
+}
+
 /// Summary of one run.
 #[derive(Debug, Clone, Serialize)]
 pub struct Report {
@@ -84,6 +122,8 @@ pub struct Report {
     pub upload_mbps_avg: f64,
     /// Highest upload bandwidth of any validator, in Mbit/s.
     pub upload_mbps_max: f64,
+    /// Block-level figures.
+    pub block: BlockStats,
     /// Protocol-specific figures.
     pub extra: Vec<(String, String)>,
 }
@@ -101,6 +141,8 @@ pub struct RunOutput<'a> {
     pub cpu: &'a Cpu,
     /// Network accounting.
     pub net: &'a Network,
+    /// Block-level figures.
+    pub block: BlockStats,
     /// Protocol-specific figures.
     pub extra: Vec<(String, String)>,
 }
@@ -167,6 +209,7 @@ impl Report {
             sig_cores_max: sig_max,
             upload_mbps_avg: mbps.iter().sum::<f64>() / n,
             upload_mbps_max: mbps.iter().copied().fold(0.0, f64::max),
+            block: out.block,
             extra: out.extra,
         }
     }
