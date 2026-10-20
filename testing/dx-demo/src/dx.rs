@@ -122,6 +122,8 @@ struct Block {
     bytes: u64,
     after_tc: bool,
     exec_cost: f64,
+    /// Transactions carried inline in the proposal (fractional: a share of the block).
+    inline_txs: f64,
     qc_at: Option<u64>,
     known_at: Vec<Option<u64>>,
     committed_at: Vec<Option<u64>>,
@@ -282,6 +284,7 @@ impl State<'_, '_> {
             bytes: 0,
             after_tc: false,
             exec_cost: 0.0,
+            inline_txs: 0.0,
             qc_at: None,
             known_at: vec![None; self.n],
             committed_at: vec![None; self.n],
@@ -544,13 +547,18 @@ impl State<'_, '_> {
         }
         let after_tc = self.rounds[r as usize - 1].via_tc;
         let mut block = self.new_block(r, leader, parent, height, now);
-        block.exec_cost = self.env.exec_model.cost_of(
+        let txs = || {
             chosen
                 .iter()
-                .flat_map(|&b| self.batches[b].txs.iter().map(|&i| &self.env.workload.txs[i])),
-        );
+                .flat_map(|&b| self.batches[b].txs.iter().map(|&i| &self.env.workload.txs[i]))
+        };
+        block.exec_cost = self.env.exec_model.cost_of(txs());
+        let inline_bytes =
+            (txs().map(|t| t.size()).sum::<u64>() as f64 * cfg.dx_inline_share) as u64;
+        block.inline_txs = txs().count() as f64 * cfg.dx_inline_share;
         block.bytes = PROPOSAL_HEADER_BYTES +
             chosen.len() as u64 * POA_BYTES +
+            inline_bytes +
             if after_tc { TC_BYTES } else { 0 };
         block.after_tc = after_tc;
         block.batches = chosen;
@@ -586,6 +594,10 @@ impl State<'_, '_> {
             cost += crypto.bls_agg_verify;
         }
         let checked = self.cpu.sig(v, now, cost);
+        let checked = self
+            .cpu
+            .parallel(v, now, block.inline_txs * crypto.ecdsa_recover)
+            .max(checked);
         // PoAs not yet in the cache are verified once, in parallel.
         let unseen = block
             .batches

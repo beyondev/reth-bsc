@@ -120,6 +120,12 @@ pub struct SimConfig {
     /// (`T_fallback`), in ms.
     #[arg(long, default_value_t = 2000)]
     pub fallback_ms: u64,
+    /// DX: share of each block's transaction bytes the leader carries inline in its proposal
+    /// (a builder batch) instead of by PoA reference. Receivers also recover those senders
+    /// before voting. The batch layer still carries every transaction, so batch bandwidth is
+    /// overstated when this is set.
+    #[arg(long, default_value_t = 0.0)]
+    pub dx_inline_share: f64,
     /// DX: the leader that forms a QC broadcasts it at once instead of only carrying it in its
     /// next proposal, so validators commit one message hop earlier.
     #[arg(long)]
