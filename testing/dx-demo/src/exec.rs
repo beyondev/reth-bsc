@@ -125,6 +125,14 @@ impl ExecCostModel {
         cost.max(self.min_block_us)
     }
 
+    /// Execution cost of one transaction, excluding the per-block cost.
+    pub const fn tx_cost(&self, tx: &Tx) -> f64 {
+        match tx.kind {
+            TxKind::Transfer => self.transfer_us,
+            TxKind::Erc20 => self.erc20_us,
+        }
+    }
+
     /// Cost of a block from its composition alone, for blocks that are never executed on the
     /// shared engine (orphaned or rejected ones).
     pub fn cost_of<'a>(&self, txs: impl Iterator<Item = &'a Tx>) -> f64 {

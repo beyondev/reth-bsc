@@ -105,6 +105,23 @@ pub struct SimConfig {
     /// transaction, so it is a lower bound on the wire cost.
     #[arg(long)]
     pub compact_tx_bytes: Option<u64>,
+    /// Parlia: stream the block while building it (`streaming-blocks-incremental-exec.md`). Every
+    /// this many ms the proposer signs and relays the transactions it appended since the last
+    /// chunk; validators that hold the parent execute them speculatively, so after the seal they
+    /// only execute what is left. The seal message carries the header and the remaining
+    /// transactions.
+    #[arg(long)]
+    pub stream_chunk_ms: Option<u64>,
+    /// Parlia with `--stream-chunk-ms`: share of each block's transactions that come from a
+    /// builder bid. The bid goes first in the block and is only known once it is locked, so
+    /// nothing can be streamed before then.
+    #[arg(long, default_value_t = 0.0)]
+    pub bid_share: f64,
+    /// Parlia with `--stream-chunk-ms`: the winning bid is locked this long before the block time
+    /// and streamed as the block's prefix; later bids may only append. Unset, the bid is chosen
+    /// at the last moment (`--miner-reserve-ms`), as geth does today.
+    #[arg(long)]
+    pub lock_ms: Option<u64>,
     /// Parlia: delay per backoff rank before another validator fills a missing in-turn block.
     #[arg(long, default_value_t = 1000)]
     pub backoff_ms: u64,

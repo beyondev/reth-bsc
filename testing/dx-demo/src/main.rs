@@ -596,6 +596,37 @@ mod tests {
     }
 
     #[test]
+    fn streamed_parlia_blocks_are_imported_sooner_after_the_seal() {
+        let base = ["--exec-us-per-tx", "1000", "--attest-depth", "3"];
+        let crypto = CryptoCosts::calibrate(small(&base).quorum());
+        let run = |extra: &[&str]| {
+            let cfg = small(&[&base[..], extra].concat());
+            run_scenario(&cfg, &crypto, Which::Parlia).remove(0)
+        };
+        let streamed_share = |r: &Report| {
+            r.extra
+                .iter()
+                .find(|(k, _)| k == "txs streamed before the seal")
+                .map(|(_, v)| v.clone())
+        };
+        let plain = run(&[]);
+        let streamed = run(&["--stream-chunk-ms", "50"]);
+        assert_eq!(streamed.finalized_ratio, 1.0);
+        assert!(
+            streamed.block.state_gap_p50_ms + 50.0 < plain.block.state_gap_p50_ms,
+            "{} vs {}",
+            streamed.block.state_gap_p50_ms,
+            plain.block.state_gap_p50_ms
+        );
+        assert!(streamed.finalized.p50 < plain.finalized.p50);
+        // A bid chosen at the last moment heads the block, so nothing can be streamed before it.
+        let unlocked = run(&["--stream-chunk-ms", "50", "--bid-share", "0.9"]);
+        assert_eq!(streamed_share(&unlocked).as_deref(), Some("0.0%"));
+        let locked = run(&["--stream-chunk-ms", "50", "--bid-share", "0.9", "--lock-ms", "150"]);
+        assert!(locked.block.state_gap_p50_ms < unlocked.block.state_gap_p50_ms);
+    }
+
+    #[test]
     fn dx_rounds_follow_the_minimum_interval() {
         let crypto = CryptoCosts::calibrate(small(&[]).quorum());
         let slow = &run_scenario(&small(&["--min-interval-ms", "450"]), &crypto, Which::Dx)[0];

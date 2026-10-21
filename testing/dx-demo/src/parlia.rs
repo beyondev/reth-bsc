@@ -7,12 +7,18 @@
 //! after its source finalizes the source; any other attestation only moves the justified block.
 //! When the turn passes to another validator, that validator must import the parent first.
 //!
+//! With `--stream-chunk-ms` the proposer streams the block while building it: every chunk of
+//! newly appended transactions is signed and relayed at once, and validators that hold the parent
+//! execute it speculatively, so after the seal they only execute what is left. A builder bid
+//! (`--bid-share`) goes first in the block and can only be streamed once it is locked
+//! (`--lock-ms`).
+//!
 //! When the in-turn validator is down, or its blocks are rejected because it executes wrongly,
 //! the honest validator with the best backoff rank produces the block after `rank * backoff`.
 //! A wrongly executing validator still broadcasts its own blocks; honest validators execute and
 //! reject them and it never votes for theirs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::{
     exec::BackgroundExec,
@@ -27,6 +33,9 @@ use crate::{
 const HEADER_BYTES: u64 = 700;
 /// One fast-finality vote message, in bytes.
 const VOTE_BYTES: u64 = 200;
+/// Framing of a stream chunk: sequence number, previous chunk hash, cumulative gas and receipts
+/// hash, and the proposer's signature.
+const CHUNK_OVERHEAD_BYTES: u64 = 200;
 
 #[derive(Debug)]
 enum Event {
@@ -40,6 +49,10 @@ enum Event {
     Arrive { v: usize, block: BlockRef },
     /// Validator `v` finished importing canonical block `h`.
     Imported { v: usize, h: u64 },
+    /// The proposer of block `h` sends stream chunk `seq`.
+    SendChunk { h: u64, seq: usize },
+    /// Stream chunk `seq` of block `h` reaches validator `v`.
+    Chunk { v: usize, h: u64, seq: usize },
     /// A vote for block `h` reaches validator `v`.
     Vote { v: usize, h: u64 },
 }
@@ -66,8 +79,37 @@ struct Block {
     justified: u64,
     finalized: u64,
     out_of_turn: bool,
-    /// Peers each validator forwards the block to after receiving it.
+    /// Validators the proposer sends the block (and its stream chunks) to itself.
+    first_hop: Vec<usize>,
+    /// Peers each validator forwards the block (and its stream chunks) to after receiving it.
     relay: Vec<Vec<usize>>,
+    /// Stream chunks sent before the seal; the seal message carries the remaining transactions.
+    chunks: Vec<Chunk>,
+}
+
+/// Transactions the proposer streamed ahead of the seal.
+#[derive(Debug)]
+struct Chunk {
+    send_at: u64,
+    txs: usize,
+    /// Share of the block's execution cost these transactions account for.
+    cost: f64,
+    bytes: u64,
+}
+
+/// A validator's speculative execution of one block's stream.
+#[derive(Debug, Default)]
+struct Stream {
+    /// Next chunk to execute.
+    next: usize,
+    /// Chunks received and signature-checked but not executed yet, by sequence number.
+    ready: BTreeMap<usize, u64>,
+    /// When execution of the chunks so far finishes.
+    done: u64,
+    cost: f64,
+    txs: usize,
+    /// Set once the block is imported; later chunks are ignored.
+    closed: bool,
 }
 
 #[derive(Debug)]
@@ -127,6 +169,7 @@ pub fn run(env: &Env<'_>) -> Report {
     let mut waiting: HashMap<(usize, u64), u64> = HashMap::new();
     // vote_times[h][v]: when validator v had each vote for block h verified.
     let mut vote_times: Vec<Vec<Vec<u64>>> = vec![vec![Vec::new(); n]];
+    let mut streams: HashMap<(usize, u64), Stream> = HashMap::new();
     let mut included = vec![false; txs.len()];
     let mut first_pending = 0usize;
 
@@ -163,11 +206,24 @@ pub fn run(env: &Env<'_>) -> Report {
                 // than the time left.
                 let built = cpu.exec(v, now, exec_cost);
                 let seal = cpu.sig(v, built.max(not_before), env.crypto.ecdsa_sign);
+                let chunks = match cfg.stream_chunk_ms {
+                    Some(ms) => {
+                        let plan = StreamPlan { now, block_time: not_before, cutoff, seal };
+                        plan.chunks(env, &chosen, v, exec_cost, ms * 1000)
+                    }
+                    None => Vec::new(),
+                };
+                let streamed: usize = chunks.iter().map(|c| c.txs).sum();
+                let tail = &chosen[streamed..];
                 let bytes = HEADER_BYTES +
                     match cfg.compact_tx_bytes {
-                        Some(per_tx) => per_tx * chosen.len() as u64,
-                        None => chosen.iter().map(|&i| txs[i].size()).sum::<u64>(),
+                        Some(per_tx) => per_tx * tail.len() as u64,
+                        None => tail.iter().map(|&i| txs[i].size()).sum::<u64>(),
                     };
+                for (seq, c) in chunks.iter().enumerate() {
+                    q.push(c.send_at, Event::SendChunk { h, seq });
+                }
+                let (first_hop, relay) = relay_tree(env, v);
                 blocks.push(Block {
                     proposer: v,
                     txs: chosen,
@@ -176,6 +232,9 @@ pub fn run(env: &Env<'_>) -> Report {
                     exec_cost,
                     bytes,
                     out_of_turn: delay > 0,
+                    first_hop,
+                    relay,
+                    chunks,
                     ..Default::default()
                 });
                 imported.push(vec![None; n]);
@@ -206,25 +265,11 @@ pub fn run(env: &Env<'_>) -> Report {
                 b.attestations = targets.len() as u64;
                 b.attest_target = targets.last().copied();
                 (b.justified, b.finalized) = (justified, finalized);
-                // Like geth's block propagation: the full block goes to sqrt(peers) validators,
-                // nearest first, and each of them forwards it to its share of the rest once the
-                // header checks out. Validators that reject the chain are served last.
-                let mut peers: Vec<usize> = (0..n).filter(|&v| v != p).collect();
-                peers.sort_by_key(|&v| (!cfg.is_honest(v), env.topo.latency_us(p, v)));
-                let fanout = if cfg.parlia_direct {
-                    peers.len()
-                } else {
-                    (peers.len() as f64).sqrt().ceil() as usize
-                };
-                let (first, rest) = peers.split_at(fanout.min(peers.len()));
-                let mut relay = vec![Vec::new(); n];
-                for (i, &v) in rest.iter().enumerate() {
-                    relay[first[i % first.len()]].push(v);
-                }
-                blocks[h as usize].relay = relay;
                 let block = BlockRef::Canonical(h);
-                net.send(env.topo, now, p, first, blocks[h as usize].bytes, &mut q, |v| {
-                    Event::Arrive { v, block }
+                let b = &blocks[h as usize];
+                net.send(env.topo, now, p, &b.first_hop, b.bytes, &mut q, |v| Event::Arrive {
+                    v,
+                    block,
                 });
                 imported[h as usize][p] = Some(now);
                 q.push(now, Event::Imported { v: p, h });
@@ -257,16 +302,16 @@ pub fn run(env: &Env<'_>) -> Report {
                         cpu.exec(v, now, rejected[id].exec_cost);
                     }
                     BlockRef::Canonical(h) => {
-                        let forward = std::mem::take(&mut blocks[h as usize].relay[v]);
-                        if !forward.is_empty() {
+                        let b = &blocks[h as usize];
+                        if !b.relay[v].is_empty() {
                             let checked = cpu.sig(v, now, env.crypto.ecdsa_recover);
-                            let bytes = blocks[h as usize].bytes;
-                            net.send(env.topo, checked, v, &forward, bytes, &mut q, |u| {
+                            net.send(env.topo, checked, v, &b.relay[v], b.bytes, &mut q, |u| {
                                 Event::Arrive { v: u, block }
                             });
                         }
                         if imported[h as usize - 1][v].is_some() {
-                            import(env, &mut cpu, &mut q, &blocks, v, h, now);
+                            let stream = streams.get_mut(&(v, h));
+                            import(env, &mut cpu, &mut q, &blocks, stream, v, h, now);
                         } else {
                             waiting.insert((v, h), now);
                         }
@@ -275,8 +320,12 @@ pub fn run(env: &Env<'_>) -> Report {
             }
             Event::Imported { v, h } => {
                 imported[h as usize][v] = Some(now);
+                let mut stream = streams.get_mut(&(v, h + 1));
+                if let Some(s) = stream.as_deref_mut() {
+                    s.advance(env, &mut cpu, &blocks[h as usize + 1], v, now);
+                }
                 if let Some(arrived) = waiting.remove(&(v, h + 1)) {
-                    import(env, &mut cpu, &mut q, &blocks, v, h + 1, arrived.max(now));
+                    import(env, &mut cpu, &mut q, &blocks, stream, v, h + 1, arrived.max(now));
                 }
                 let signed = cpu.sig(v, now, env.crypto.bls_sign);
                 vote_times[h as usize][v].push(signed);
@@ -287,6 +336,36 @@ pub fn run(env: &Env<'_>) -> Report {
                     let not_before = blocks[h as usize].seal + interval + delay;
                     let start = if delay > 0 { now.max(not_before) } else { now };
                     q.push(start, Event::Build { h: h + 1, v });
+                }
+            }
+            Event::SendChunk { h, seq } => {
+                let b = &blocks[h as usize];
+                let bytes = b.chunks[seq].bytes;
+                net.send(env.topo, now, b.proposer, &b.first_hop, bytes, &mut q, |v| {
+                    Event::Chunk { v, h, seq }
+                });
+            }
+            Event::Chunk { v, h, seq } => {
+                if !cfg.is_honest(v) {
+                    continue;
+                }
+                let b = &blocks[h as usize];
+                let checked = cpu.sig(v, now, env.crypto.ecdsa_recover);
+                if !b.relay[v].is_empty() {
+                    let bytes = b.chunks[seq].bytes;
+                    net.send(env.topo, checked, v, &b.relay[v], bytes, &mut q, |u| Event::Chunk {
+                        v: u,
+                        h,
+                        seq,
+                    });
+                }
+                let s = streams.entry((v, h)).or_default();
+                if s.closed {
+                    continue;
+                }
+                s.ready.insert(seq, checked);
+                if imported[h as usize - 1][v].is_some() {
+                    s.advance(env, &mut cpu, b, v, now);
                 }
             }
             Event::Vote { v, h } => {
@@ -398,13 +477,19 @@ pub fn run(env: &Env<'_>) -> Report {
     let mean_exec =
         window_blocks.iter().map(|b| b.exec_cost).sum::<f64>() / window_blocks.len().max(1) as f64;
     let count = window_blocks.len();
-    let extra = vec![
+    let streamed = window_blocks.iter().flat_map(|b| &b.chunks).map(|c| c.txs).sum::<usize>();
+    let total_txs = window_blocks.iter().map(|b| b.txs.len()).sum::<usize>();
+    let mut extra = vec![
         ("blocks sealed late (>1ms)".to_string(), format!("{late} / {count}")),
         ("blocks with an attestation".to_string(), format!("{attested_blocks} / {count}")),
         ("attestations below the parent".to_string(), format!("{lagged} / {count}")),
         ("mean block execution (ms)".to_string(), format!("{:.1}", mean_exec / 1000.0)),
         ("failed txs".to_string(), engine.finish().to_string()),
     ];
+    if cfg.stream_chunk_ms.is_some() {
+        let share = 100.0 * streamed as f64 / total_txs.max(1) as f64;
+        extra.push(("txs streamed before the seal".to_string(), format!("{share:.1}%")));
+    }
     Report::build(
         cfg,
         env.workload,
@@ -449,12 +534,15 @@ fn select_txs(
 }
 
 /// Validator `v` imports block `h`: seal check, attestation check and sender recovery run in
-/// parallel with execution, as in reth's payload processor.
+/// parallel with execution, as in reth's payload processor. Transactions it already executed
+/// from the block's stream are not executed again.
+#[allow(clippy::too_many_arguments)]
 fn import(
     env: &Env<'_>,
     cpu: &mut Cpu,
     q: &mut EventQueue<Event>,
     blocks: &[Block],
+    stream: Option<&mut Stream>,
     v: usize,
     h: u64,
     at: u64,
@@ -463,9 +551,140 @@ fn import(
     let mut checks = env.crypto.ecdsa_recover;
     checks += b.attestations as f64 * env.crypto.bls_agg_verify;
     let checked = cpu.sig(v, at, checks);
-    let recovered = cpu.parallel(v, at, b.txs.len() as f64 * env.crypto.ecdsa_recover);
-    let executed = cpu.exec(v, at, b.exec_cost);
+    let (done, cost, txs) = match stream {
+        Some(s) => {
+            s.closed = true;
+            (s.done, s.cost, s.txs)
+        }
+        None => (0, 0.0, 0),
+    };
+    let left = (b.txs.len() - txs) as f64;
+    let recovered = cpu.parallel(v, at, left * env.crypto.ecdsa_recover);
+    let executed = cpu.exec(v, at.max(done), (b.exec_cost - cost).max(0.0));
     q.push(checked.max(recovered).max(executed), Event::Imported { v, h });
+}
+
+impl Stream {
+    /// Executes, in order, every received chunk that directly follows the ones executed so far.
+    /// The parent must already be imported.
+    fn advance(&mut self, env: &Env<'_>, cpu: &mut Cpu, block: &Block, v: usize, at: u64) {
+        if self.closed {
+            return;
+        }
+        while let Some(ready) = self.ready.remove(&self.next) {
+            let c = &block.chunks[self.next];
+            let start = ready.max(at);
+            let recovered = cpu.parallel(v, start, c.txs as f64 * env.crypto.ecdsa_recover);
+            let executed = cpu.exec(v, start, c.cost);
+            self.done = executed.max(recovered);
+            self.cost += c.cost;
+            self.txs += c.txs;
+            self.next += 1;
+        }
+    }
+}
+
+/// When the proposer of a block may stream what: it starts building at `now`, seals at `seal`,
+/// takes no transactions after `cutoff` and the block time is `block_time`.
+#[derive(Debug)]
+struct StreamPlan {
+    now: u64,
+    block_time: u64,
+    cutoff: u64,
+    seal: u64,
+}
+
+impl StreamPlan {
+    /// Splits `chosen` into chunks of `chunk_us` sent ahead of the seal; transactions after the
+    /// last chunk go with the seal.
+    ///
+    /// The first `bid_share` of the block is a builder bid, known only from the lock time on; the
+    /// proposer already simulated it, so it streams at once. Local transactions follow it and
+    /// have to be executed again on top of it before they can be streamed. Every other transaction
+    /// joins the first chunk boundary after it reaches the proposer, and a chunk leaves once
+    /// the proposer has executed it. The block's execution cost, less the per-block part, is
+    /// split over the transactions by their cost.
+    fn chunks(
+        &self,
+        env: &Env<'_>,
+        chosen: &[usize],
+        v: usize,
+        exec_cost: f64,
+        chunk_us: u64,
+    ) -> Vec<Chunk> {
+        let cfg = env.cfg;
+        let txs = &env.workload.txs;
+        let bids = (cfg.bid_share * chosen.len() as f64).round() as usize;
+        let start = if bids > 0 {
+            let lock_ms = cfg.lock_ms.unwrap_or(cfg.miner_reserve_ms);
+            self.now.max(self.block_time.saturating_sub(lock_ms * 1000))
+        } else {
+            self.now
+        };
+        let weights: Vec<f64> = chosen.iter().map(|&i| env.exec_model.tx_cost(&txs[i])).collect();
+        let total: f64 = weights.iter().sum();
+        let body = (exec_cost - env.exec_model.block_us).max(0.0);
+        let cost = |w: f64| if total > 0.0 { body * w / total } else { 0.0 };
+
+        let mut chunks: Vec<Chunk> = Vec::new();
+        let mut proposer_done = start;
+        let mut j = 0;
+        while j < chosen.len() {
+            let avail = |j: usize| {
+                if j < bids {
+                    start
+                } else {
+                    env.workload.arrival_at(chosen[j], v, env.topo).max(start)
+                }
+            };
+            let boundary = start + (avail(j) - start).div_ceil(chunk_us) * chunk_us;
+            if boundary >= self.cutoff {
+                break;
+            }
+            // The bid goes out as a chunk of its own, so it does not wait for the proposer to
+            // re-execute local transactions on top of it.
+            let limit = if j < bids { bids } else { chosen.len() };
+            let mut end = j;
+            let mut own = 0.0;
+            let mut share = 0.0;
+            while end < limit && avail(end) <= boundary {
+                share += cost(weights[end]);
+                if end >= bids {
+                    own += cost(weights[end]);
+                }
+                end += 1;
+            }
+            proposer_done = proposer_done.max(avail(j)) + own.ceil() as u64;
+            let send_at = boundary.max(proposer_done);
+            if send_at >= self.seal {
+                break;
+            }
+            let bytes =
+                CHUNK_OVERHEAD_BYTES + chosen[j..end].iter().map(|&i| txs[i].size()).sum::<u64>();
+            chunks.push(Chunk { send_at, txs: end - j, cost: share, bytes });
+            j = end;
+        }
+        chunks
+    }
+}
+
+/// Like geth's block propagation: the full block goes to sqrt(peers) validators, nearest first,
+/// and each of them forwards it to its share of the rest once the header checks out. Validators
+/// that reject the chain are served last. Returns the proposer's own recipients and, for each
+/// validator, the peers it forwards to.
+fn relay_tree(env: &Env<'_>, p: usize) -> (Vec<usize>, Vec<Vec<usize>>) {
+    let cfg = env.cfg;
+    let n = cfg.validators;
+    let mut peers: Vec<usize> = (0..n).filter(|&v| v != p).collect();
+    peers.sort_by_key(|&v| (!cfg.is_honest(v), env.topo.latency_us(p, v)));
+    let fanout =
+        if cfg.parlia_direct { peers.len() } else { (peers.len() as f64).sqrt().ceil() as usize };
+    let (first, rest) = peers.split_at(fanout.min(peers.len()));
+    let mut relay = vec![Vec::new(); n];
+    for (i, &v) in rest.iter().enumerate() {
+        relay[first[i % first.len()]].push(v);
+    }
+    (first.to_vec(), relay)
 }
 
 /// Deterministic pseudo-random rank used for the backoff order.
