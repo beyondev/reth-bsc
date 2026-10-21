@@ -2,7 +2,7 @@
 
 use serde::Serialize;
 
-use crate::{config::SimConfig, net::Network, sim::Cpu, workload::Workload};
+use crate::{config::SimConfig, net::RealStats, sim::Cpu, workload::Workload};
 
 /// Absolute times at which each transaction reached a milestone. `None` means never.
 #[derive(Debug)]
@@ -139,8 +139,10 @@ pub struct RunOutput<'a> {
     pub block_times: &'a [u64],
     /// CPU accounting.
     pub cpu: &'a Cpu,
-    /// Network accounting.
-    pub net: &'a Network,
+    /// Bytes each validator sent inside the measurement window.
+    pub bytes_sent: &'a [u64],
+    /// Event-loop statistics when messages went over the real network.
+    pub real: Option<&'a RealStats>,
     /// Block-level figures.
     pub block: BlockStats,
     /// Protocol-specific figures.
@@ -190,7 +192,7 @@ impl Report {
         let (exec_avg, exec_max) = util(&out.cpu.exec_busy);
         let (sig_avg, sig_max) = util(&out.cpu.sig_busy);
         let mbps: Vec<f64> =
-            out.net.bytes_sent.iter().map(|&b| b as f64 * 8.0 / 1e6 / window_s).collect();
+            out.bytes_sent.iter().map(|&b| b as f64 * 8.0 / 1e6 / window_s).collect();
 
         Self {
             protocol: out.protocol.to_string(),
@@ -210,7 +212,7 @@ impl Report {
             upload_mbps_avg: mbps.iter().sum::<f64>() / n,
             upload_mbps_max: mbps.iter().copied().fold(0.0, f64::max),
             block: out.block,
-            extra: out.extra,
+            extra: with_real_stats(out.extra, out.real),
         }
     }
 
@@ -324,4 +326,26 @@ pub fn median(mut values: Vec<u64>) -> Option<u64> {
     }
     let mid = values.len() / 2;
     Some(*values.select_nth_unstable(mid).1)
+}
+
+/// Appends the real-network event-loop figures to a run's protocol-specific rows.
+fn with_real_stats(
+    mut extra: Vec<(String, String)>,
+    real: Option<&RealStats>,
+) -> Vec<(String, String)> {
+    if let Some(r) = real {
+        let mut lag = r.lag_us.clone();
+        extra.push(("real-net messages".to_string(), r.messages.to_string()));
+        extra.push((
+            "event lag p50 / p99 / max (ms)".to_string(),
+            format!(
+                "{:.2} / {:.2} / {:.2}",
+                percentile_ms(&mut lag.clone(), 0.5),
+                percentile_ms(&mut lag.clone(), 0.99),
+                lag.iter_mut().map(|l| *l as f64 / 1000.0).fold(0.0, f64::max)
+            ),
+        ));
+        extra.push(("deliveries after a later event".to_string(), r.reordered.to_string()));
+    }
+    extra
 }

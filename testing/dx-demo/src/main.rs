@@ -10,6 +10,7 @@ mod dx;
 mod exec;
 mod net;
 mod parlia;
+mod realnet;
 mod report;
 mod sim;
 mod workload;
@@ -38,6 +39,8 @@ pub struct Env<'a> {
     pub exec_model: &'a ExecCostModel,
     /// Simulated seconds after the last transaction is created, so it can reach finality.
     pub drain_s: f64,
+    /// Agent launch details when messages go over the real network.
+    pub realnet: Option<&'a realnet::RealNetSpec>,
 }
 
 #[derive(Debug, Parser)]
@@ -77,6 +80,24 @@ enum Cmd {
         /// Seeds to run each scenario with; the run with the median block rate is shown.
         #[arg(long, value_delimiter = ',', default_value = "1,2,3")]
         seeds: Vec<u64>,
+        /// Run every scenario over the real network (see `run --real-net`).
+        #[arg(long)]
+        real_net: bool,
+    },
+    /// Real-network agent for one validator (started by `--real-net` runs, not by hand).
+    Agent {
+        /// Validator index.
+        #[arg(long)]
+        id: usize,
+        /// Number of validators.
+        #[arg(long)]
+        n: usize,
+        /// Controller's control socket.
+        #[arg(long)]
+        ctl: PathBuf,
+        /// Send frames one after another, paced at this upload rate in Mbit/s.
+        #[arg(long)]
+        serial_mbps: Option<f64>,
     },
     /// Run the built-in scenario set and write a Markdown report.
     Sweep {
@@ -124,8 +145,8 @@ fn main() {
                 std::fs::write(path, body).expect("writable output");
             }
         }
-        Cmd::Scenarios { out, json, seeds } => {
-            let (md, runs) = scenarios(&seeds);
+        Cmd::Scenarios { out, json, seeds, real_net } => {
+            let (md, runs) = scenarios(&seeds, real_net);
             std::fs::write(&out, md).expect("writable output");
             println!("wrote {}", out.display());
             if let Some(path) = json {
@@ -133,6 +154,7 @@ fn main() {
                 std::fs::write(path, body).expect("writable output");
             }
         }
+        Cmd::Agent { id, n, ctl, serial_mbps } => realnet::agent_main(id, n, &ctl, serial_mbps),
         Cmd::Sweep { cfg, out } => {
             let md = sweep(&cfg);
             std::fs::write(&out, md).expect("writable output");
@@ -145,6 +167,13 @@ fn run_scenario(cfg: &SimConfig, crypto: &CryptoCosts, which: Which) -> Vec<Repo
     let topo = Topology::new(cfg.validators, cfg.seed, cfg.latency_ms);
     let workload = Workload::generate(cfg, &topo);
     let exec_model = ExecCostModel::calibrate(cfg);
+    let spec = cfg.real_net.then(|| realnet::RealNetSpec {
+        dir: std::env::temp_dir().join("dx-realnet"),
+        exe: std::env::current_exe().expect("own executable"),
+        serial_mbps: cfg.real_net_serial.then_some(cfg.bandwidth_mbps),
+    });
+    let _namespaces =
+        cfg.real_net.then(|| realnet::Namespaces::create(cfg.validators, cfg.bandwidth_mbps));
     let env = Env {
         cfg,
         workload: &workload,
@@ -152,6 +181,7 @@ fn run_scenario(cfg: &SimConfig, crypto: &CryptoCosts, which: Which) -> Vec<Repo
         crypto,
         exec_model: &exec_model,
         drain_s: DRAIN_S,
+        realnet: spec.as_ref(),
     };
     let mut reports = Vec::new();
     if which != Which::Dx {
@@ -242,8 +272,9 @@ fn scenario_base() -> SimConfig {
     ConfigArgs::parse_from(SCENARIO_BASE).cfg
 }
 
-fn scenarios(seeds: &[u64]) -> (String, Vec<ScenarioRun>) {
-    let base = scenario_base();
+fn scenarios(seeds: &[u64], real_net: bool) -> (String, Vec<ScenarioRun>) {
+    let mut base = scenario_base();
+    base.real_net = real_net;
     let scenarios = [
         Scenario {
             title: "baseline",
@@ -269,7 +300,8 @@ fn scenarios(seeds: &[u64]) -> (String, Vec<ScenarioRun>) {
         },
     ];
     let variants = [
-        Variant { label: "Parlia", which: Which::Parlia, apply: |_| {} },
+        Variant { label: "Parlia, pre-Fermi", which: Which::Parlia, apply: |_| {} },
+        Variant { label: "Parlia, Fermi", which: Which::Parlia, apply: |c| c.attest_depth = 3 },
         Variant { label: "DX, QC broadcast", which: Which::Dx, apply: |c| c.qc_broadcast = true },
         Variant { label: "DX, QC in next proposal", which: Which::Dx, apply: |_| {} },
     ];

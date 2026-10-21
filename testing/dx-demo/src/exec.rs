@@ -5,7 +5,7 @@
 //! model calibrated with the same engine, which keeps the two protocols' costs identical for
 //! identical transactions and free of measurement noise.
 
-use std::time::Instant;
+use std::{sync::mpsc, thread, time::Instant};
 
 use alloy_primitives::{keccak256, Address, Bytes, TxKind as EvmTxKind, B256, U256};
 use alloy_rlp::Encodable;
@@ -136,6 +136,38 @@ impl ExecCostModel {
             }
         }
         self.block_cost(&exec)
+    }
+}
+
+/// Executes canonical blocks on an [`ExecEngine`] in a background thread, so the real revm work
+/// that makes gas and failures real does not stall a wall-clock event loop. Charged execution
+/// time comes from [`ExecCostModel::cost_of`], which depends only on block composition.
+#[derive(Debug)]
+pub struct BackgroundExec {
+    tx: mpsc::Sender<Vec<Tx>>,
+    handle: thread::JoinHandle<usize>,
+}
+
+impl BackgroundExec {
+    /// Starts the executor over `accounts` funded accounts.
+    pub fn new(accounts: usize) -> Self {
+        let (tx, rx) = mpsc::channel::<Vec<Tx>>();
+        let handle = thread::spawn(move || {
+            let mut engine = ExecEngine::new(accounts);
+            rx.iter().map(|block| engine.execute(block.iter()).failed).sum()
+        });
+        Self { tx, handle }
+    }
+
+    /// Queues the next canonical block.
+    pub fn submit<'a>(&self, txs: impl Iterator<Item = &'a Tx>) {
+        self.tx.send(txs.cloned().collect()).expect("executor thread alive");
+    }
+
+    /// Waits for every queued block and returns the number of failed transactions.
+    pub fn finish(self) -> usize {
+        drop(self.tx);
+        self.handle.join().expect("executor thread")
     }
 }
 

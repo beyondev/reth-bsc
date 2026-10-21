@@ -6,6 +6,8 @@ side-by-side comparison.
 
 It is a demo of the protocol flow, not a networked node: all validators live in one process
 and a discrete-event clock stands in for real time.
+With `--real-net` the messages instead travel as real bytes between per-validator processes (see
+[Real network mode](#real-network-mode)).
 
 ## What is real and what is modelled
 
@@ -44,4 +46,40 @@ signature CPU figures are on the high side.
 [SCENARIOS.md](SCENARIOS.md) holds the output of `scenarios`: 4 validators, 50 ms blocks, every
 block taking 20 ms to execute and 5 ms latency, under a baseline, 4000 tx/s, 100 ms execution,
 20 ms latency, one validator down and one validator computing a wrong state root. Each is run
-with three seeds, for Parlia and for DX with and without `--qc-broadcast`.
+with three seeds, for Parlia under the pre-Fermi (`--attest-depth 1`) and Fermi (`3`) attestation
+rules and for DX with and without `--qc-broadcast`. [SCENARIOS-realnet.md](SCENARIOS-realnet.md) is
+the same set run with `--real-net`.
+
+## Real network mode
+
+`--real-net` (on `run` and `scenarios`) carries every protocol message as real bytes instead of
+computing its arrival time:
+
+- Each validator gets its own network namespace (`dxnet<i>`), joined to a bridge by a veth pair
+  whose uplink is limited to `--bandwidth-mbps` with an HTB qdisc.
+- One `dx-demo agent` process per validator runs inside its namespace and keeps a TCP
+  connection to every other agent. A message of `n` bytes is written to the socket as an
+  `n`-byte frame and reported back to the controller when its last byte arrives.
+- The controller runs the protocol state machines in wall-clock time. A message is delivered
+  when the agent reports it, plus the one-way latency and jitter of the topology, which are
+  added in user space because many container kernels (this one included) ship without
+  `sch_netem`. TCP therefore never sees the WAN round trip.
+- CPU work (execution, signatures, sender recovery) stays modelled as in the default mode;
+  revm runs on a background thread so it does not delay the event loop.
+
+The report gains three rows: messages carried, how late the event loop handled events
+(p50 / p99 / max), and how many deliveries arrived after a later event had already been handled.
+It needs root, `ip` and `tc` (`apt-get install iproute2`).
+
+By default each agent writes to all its peers at once, so concurrent messages share the uplink
+the way parallel TCP flows do. `--real-net-serial` makes each agent send frames one after
+another, paced at the uplink rate, which is the FIFO upload link of the modelled mode carried
+over real TCP. The two differ when a validator's uplink is saturated: a leader broadcasting a
+large proposal reaches every peer only at the end of the whole fan-out when the flows share the
+link, but reaches the nearest quorum early when it sends to one peer after another.
+
+```bash
+sudo target/release/dx-demo run --validators 21 --tps 8000 --gas-limit 300000000 \
+  --exec-us-per-tx 100 --attest-depth 3 --real-net
+sudo target/release/dx-demo scenarios --real-net --out SCENARIOS-realnet.md
+```

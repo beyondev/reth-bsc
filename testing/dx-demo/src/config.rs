@@ -60,6 +60,20 @@ pub struct SimConfig {
     #[arg(long, value_delimiter = ',')]
     pub bad_exec: Vec<usize>,
 
+    /// Carry every message as real bytes over TCP between one agent process per validator,
+    /// each in its own network namespace with an HTB-limited uplink, and run the event loop in
+    /// wall-clock time. Needs root, `ip` and `tc`. Latency and jitter are still added in user
+    /// space.
+    #[arg(long)]
+    pub real_net: bool,
+
+    /// With `--real-net`: each agent sends its frames one after another, in the order the
+    /// protocol queued them, paced at the uplink rate, instead of writing to all peers at once and
+    /// letting the qdisc share the link between the flows. This is the FIFO upload link of the
+    /// modelled mode, carried over real TCP.
+    #[arg(long)]
+    pub real_net_serial: bool,
+
     /// Parlia: block interval in milliseconds.
     #[arg(long, default_value_t = 450)]
     pub block_interval_ms: u64,

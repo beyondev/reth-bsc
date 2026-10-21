@@ -3,8 +3,18 @@
 //! Downlinks are not modelled; validators are assumed to be fully connected, which is how BSC
 //! validators peer today.
 
+use std::{
+    collections::{BTreeMap, HashMap},
+    time::Duration,
+};
+
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
+
+use crate::{
+    realnet::{Arrival, Cluster},
+    sim::EventQueue,
+};
 
 /// Regions, the share of validators placed in each, and one-way latency between them in ms.
 ///
@@ -76,9 +86,14 @@ impl Topology {
     }
 }
 
-/// Upload links of all validators.
+/// Upload links of all validators, and the transport that carries messages over them.
+///
+/// In the default (modelled) mode a message's arrival time is computed from a FIFO upload link
+/// and the latency table. With a [`Cluster`] the message is sent as real bytes between agent
+/// processes and delivered when the last byte has arrived plus the link latency; the event loop
+/// then runs in wall-clock time (see [`Network::next`]).
 #[derive(Debug)]
-pub struct Network {
+pub struct Network<E> {
     /// Time at which each validator's upload link becomes idle.
     uplink_free: Vec<u64>,
     /// Upload speed in bytes per microsecond.
@@ -90,17 +105,53 @@ pub struct Network {
     /// Per-message jitter (plus or minus) in microseconds.
     jitter_us: u64,
     rng: ChaCha8Rng,
+    real: Option<RealTransport<E>>,
 }
 
-impl Network {
+/// State of the real-network mode.
+#[derive(Debug)]
+struct RealTransport<E> {
+    cluster: Cluster,
+    next_msg: u64,
+    /// Event to deliver for each (message, recipient), with the link latency to add.
+    pending: HashMap<(u64, usize), (E, u64)>,
+    /// Sends the protocol scheduled for a later time (after modelled CPU work).
+    deferred: BTreeMap<(u64, u64), DeferredSend>,
+    /// Latest event time handed out, so the event loop never goes back in time.
+    last_event: u64,
+    stats: RealStats,
+}
+
+/// A send held back until the wall clock reaches its time.
+#[derive(Debug)]
+struct DeferredSend {
+    from: usize,
+    to: Vec<usize>,
+    wire: u64,
+}
+
+/// How faithfully the wall-clock event loop kept up with the protocol.
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct RealStats {
+    /// How late each event was handled relative to its scheduled time, in microseconds.
+    pub lag_us: Vec<u64>,
+    /// Messages delivered over the real network.
+    pub messages: u64,
+    /// Deliveries that arrived after a later event had already been handled.
+    pub reordered: u64,
+}
+
+impl<E> Network<E> {
     /// Creates idle links of `bandwidth_mbps` for `n` validators. Each message gets a random
-    /// extra delay in `[-jitter_us, +jitter_us]`.
+    /// extra delay in `[-jitter_us, +jitter_us]`. With `cluster` set, messages travel over the
+    /// real network between the cluster's agents.
     pub fn new(
         n: usize,
         bandwidth_mbps: f64,
         measure_from_us: u64,
         jitter_us: u64,
         seed: u64,
+        cluster: Option<Cluster>,
     ) -> Self {
         Self {
             uplink_free: vec![0; n],
@@ -109,11 +160,35 @@ impl Network {
             measure_from_us,
             jitter_us,
             rng: ChaCha8Rng::seed_from_u64(seed ^ 0x6a69_7474),
+            real: cluster.map(|cluster| RealTransport {
+                cluster,
+                next_msg: 0,
+                pending: HashMap::new(),
+                deferred: BTreeMap::new(),
+                last_event: 0,
+                stats: RealStats::default(),
+            }),
         }
     }
 
-    /// Sends `bytes` from `from` to each of `to`, one copy after another on the upload link.
-    /// Returns the arrival time at each recipient, in the order given.
+    /// Event-loop statistics of the real-network mode.
+    pub fn real_stats(&self) -> Option<&RealStats> {
+        self.real.as_ref().map(|r| &r.stats)
+    }
+
+    fn latency(&mut self, topology: &Topology, from: usize, dst: usize) -> u64 {
+        let mut latency = topology.latency_us(from, dst) as i64;
+        if self.jitter_us > 0 {
+            let j = self.jitter_us as i64;
+            latency = (latency + self.rng.gen_range(-j..=j)).max(0);
+        }
+        latency as u64
+    }
+
+    /// Sends `bytes` from `from` to each of `to` at time `now` and schedules `event(recipient)`
+    /// at each recipient's arrival. In the modelled mode the copies go one after another on the
+    /// upload link.
+    #[allow(clippy::too_many_arguments)]
     pub fn send(
         &mut self,
         topology: &Topology,
@@ -121,37 +196,104 @@ impl Network {
         from: usize,
         to: &[usize],
         bytes: u64,
-    ) -> Vec<(usize, u64)> {
+        q: &mut EventQueue<E>,
+        event: impl Fn(usize) -> E,
+    ) {
         let wire = bytes + MESSAGE_OVERHEAD;
-        let per_copy = wire as f64 / self.bytes_per_us;
-        let mut t = self.uplink_free[from].max(now) as f64;
-        let mut out = Vec::with_capacity(to.len());
-        for &dst in to {
-            t += per_copy;
-            let mut latency = topology.latency_us(from, dst) as i64;
-            if self.jitter_us > 0 {
-                let j = self.jitter_us as i64;
-                latency = (latency + self.rng.gen_range(-j..=j)).max(0);
-            }
-            out.push((dst, t as u64 + latency as u64));
-        }
-        self.uplink_free[from] = t as u64;
         if now >= self.measure_from_us {
             self.bytes_sent[from] += wire * to.len() as u64;
         }
-        out
+        if self.real.is_some() {
+            let latencies: Vec<u64> = to.iter().map(|&d| self.latency(topology, from, d)).collect();
+            let real = self.real.as_mut().expect("real mode");
+            let msg = real.next_msg;
+            real.next_msg += 1;
+            for (&dst, latency) in to.iter().zip(latencies) {
+                real.pending.insert((msg, dst), (event(dst), latency));
+            }
+            if now <= real.cluster.now() {
+                real.cluster.dispatch(from, msg, to, wire);
+            } else {
+                real.deferred.insert((now, msg), DeferredSend { from, to: to.to_vec(), wire });
+            }
+            return;
+        }
+        let per_copy = wire as f64 / self.bytes_per_us;
+        let mut t = self.uplink_free[from].max(now) as f64;
+        for &dst in to {
+            t += per_copy;
+            let latency = self.latency(topology, from, dst);
+            q.push(t as u64 + latency, event(dst));
+        }
+        self.uplink_free[from] = t as u64;
     }
 
     /// Sends to every validator except `from`, nearest first.
+    #[allow(clippy::too_many_arguments)]
     pub fn broadcast(
         &mut self,
         topology: &Topology,
         now: u64,
         from: usize,
         bytes: u64,
-    ) -> Vec<(usize, u64)> {
+        q: &mut EventQueue<E>,
+        event: impl Fn(usize) -> E,
+    ) {
         let mut peers: Vec<usize> = (0..self.uplink_free.len()).filter(|&v| v != from).collect();
         peers.sort_by_key(|&v| topology.latency_us(from, v));
-        self.send(topology, now, from, &peers, bytes)
+        self.send(topology, now, from, &peers, bytes, q, event);
+    }
+
+    /// Next event to handle. In the modelled mode this is simply the earliest queued event. In
+    /// the real-network mode it waits until the earliest event is due in wall-clock time,
+    /// meanwhile dispatching deferred sends and turning reported arrivals into events.
+    pub fn next(&mut self, q: &mut EventQueue<E>) -> Option<(u64, E)> {
+        let Some(real) = self.real.as_mut() else { return q.pop() };
+        loop {
+            while let Ok(a) = real.cluster.arrivals.try_recv() {
+                real.deliver(a, q);
+            }
+            let now = real.cluster.now();
+            while let Some((&(t, msg), _)) = real.deferred.first_key_value() {
+                if t > now {
+                    break;
+                }
+                let send = real.deferred.remove(&(t, msg)).expect("present");
+                real.cluster.dispatch(send.from, msg, &send.to, send.wire);
+            }
+            if let Some(t) = q.peek_time() {
+                if t <= now {
+                    let (t, e) = q.pop().expect("peeked");
+                    real.stats.lag_us.push(now - t);
+                    let t = t.max(real.last_event);
+                    real.last_event = t;
+                    return Some((t, e));
+                }
+            }
+            let wake = [q.peek_time(), real.deferred.first_key_value().map(|(&(t, _), _)| t)]
+                .into_iter()
+                .flatten()
+                .min();
+            if wake.is_none() && real.pending.is_empty() {
+                return None;
+            }
+            let wait = wake.map_or(5_000, |t| t.saturating_sub(now).min(5_000));
+            if let Ok(a) = real.cluster.arrivals.recv_timeout(Duration::from_micros(wait)) {
+                real.deliver(a, q);
+            }
+        }
+    }
+}
+
+impl<E> RealTransport<E> {
+    fn deliver(&mut self, a: Arrival, q: &mut EventQueue<E>) {
+        if let Some((event, latency)) = self.pending.remove(&(a.msg, a.dst)) {
+            let at = self.cluster.to_run_time(a.recv_us) + latency;
+            if at < self.last_event {
+                self.stats.reordered += 1;
+            }
+            self.stats.messages += 1;
+            q.push(at.max(self.last_event), event);
+        }
     }
 }

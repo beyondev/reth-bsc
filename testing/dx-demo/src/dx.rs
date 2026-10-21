@@ -16,8 +16,9 @@
 //!   (backpressure). ExecVotes from a wrongly executing validator never match.
 
 use crate::{
-    exec::ExecEngine,
+    exec::BackgroundExec,
     net::Network,
+    realnet::Cluster,
     report::{median, percentile_ms, BlockStats, Report, RunOutput, TxTimes},
     sim::{Cpu, EventQueue},
     workload::Tx,
@@ -138,8 +139,8 @@ struct State<'a, 'e> {
     n: usize,
     q: EventQueue<Event>,
     cpu: Cpu,
-    net: Network,
-    engine: ExecEngine,
+    net: Network<Event>,
+    engine: Option<BackgroundExec>,
     batches: Vec<Batch>,
     /// Batches with a PoA that no live block holds.
     open_poas: Vec<usize>,
@@ -162,7 +163,6 @@ struct State<'a, 'e> {
     engine_next: u64,
     tcs: Vec<u64>,
     safe: bool,
-    failed_txs: usize,
 }
 
 /// Runs the DX simulation and returns its report.
@@ -198,8 +198,9 @@ pub fn run(env: &Env<'_>) -> Report {
             window.0,
             (cfg.jitter_ms * 1000.0) as u64,
             cfg.seed,
+            env.realnet.map(|spec| Cluster::launch(spec, n)),
         ),
-        engine: ExecEngine::new(env.workload.accounts),
+        engine: Some(BackgroundExec::new(env.workload.accounts)),
         batches: Vec::new(),
         open_poas: Vec::new(),
         owner_queue,
@@ -218,7 +219,6 @@ pub fn run(env: &Env<'_>) -> Report {
         engine_next: 1,
         tcs: Vec::new(),
         safe: true,
-        failed_txs: 0,
     };
     // Genesis: round 0 and block 0 are certified, committed, executed and have an ExecCert.
     let mut genesis_round = s.new_round(n - 1, cfg.turn_length - 1);
@@ -239,7 +239,7 @@ pub fn run(env: &Env<'_>) -> Report {
         s.enter_round(v, 1, 0);
     }
 
-    while let Some((now, ev)) = s.q.pop() {
+    while let Some((now, ev)) = s.net.next(&mut s.q) {
         if now > end {
             break;
         }
@@ -341,9 +341,9 @@ impl State<'_, '_> {
                 batch.stored_at[v] = Some(recovered);
                 let acked = self.cpu.sig(v, recovered, crypto.bls_sign);
                 let author = batch.author;
-                for (_, at) in self.net.send(self.env.topo, acked, v, &[author], ACK_BYTES) {
-                    self.q.push(at, Event::Ack(b));
-                }
+                self.net.send(self.env.topo, acked, v, &[author], ACK_BYTES, &mut self.q, |_| {
+                    Event::Ack(b)
+                });
             }
             Event::Ack(b) => self.on_ack(now, b),
             Event::Poa { v, b } => {
@@ -446,9 +446,9 @@ impl State<'_, '_> {
             batch.body_at[v] = Some(signed);
             batch.stored_at[v] = Some(signed);
             self.batches.push(batch);
-            for (u, at) in self.net.broadcast(self.env.topo, signed, v, bytes) {
-                self.q.push(at, Event::BatchArrive { v: u, b });
-            }
+            self.net.broadcast(self.env.topo, signed, v, bytes, &mut self.q, |u| {
+                Event::BatchArrive { v: u, b }
+            });
             // The author acks its own batch.
             let acked = self.cpu.sig(v, signed, self.env.crypto.bls_sign);
             self.q.push(acked, Event::Ack(b));
@@ -467,9 +467,10 @@ impl State<'_, '_> {
         let formed = self.cpu.sig(author, now, cost);
         self.batches[b].poa_at[author] = Some(formed);
         self.open_poas.push(b);
-        for (v, at) in self.net.broadcast(self.env.topo, formed, author, POA_BYTES) {
-            self.q.push(at, Event::Poa { v, b });
-        }
+        self.net.broadcast(self.env.topo, formed, author, POA_BYTES, &mut self.q, |v| Event::Poa {
+            v,
+            b,
+        });
     }
 
     /// Validator `v` moves to round `r` and arms its timer.
@@ -570,9 +571,9 @@ impl State<'_, '_> {
         self.blocks_at_height[height as usize].push(id);
         self.rounds[r as usize].block = Some(id);
         let signed = self.cpu.sig(leader, now, crypto.bls_sign);
-        for (v, at) in self.net.broadcast(self.env.topo, signed, leader, bytes) {
-            self.q.push(at, Event::Proposal { v, blk: id });
-        }
+        self.net.broadcast(self.env.topo, signed, leader, bytes, &mut self.q, |v| {
+            Event::Proposal { v, blk: id }
+        });
         self.blocks[id].known_at[leader] = Some(signed);
         self.vote(leader, r, signed);
         self.schedule_exec(signed, leader);
@@ -594,10 +595,8 @@ impl State<'_, '_> {
             cost += crypto.bls_agg_verify;
         }
         let checked = self.cpu.sig(v, now, cost);
-        let checked = self
-            .cpu
-            .parallel(v, now, block.inline_txs * crypto.ecdsa_recover)
-            .max(checked);
+        let checked =
+            self.cpu.parallel(v, now, block.inline_txs * crypto.ecdsa_recover).max(checked);
         // PoAs not yet in the cache are verified once, in parallel.
         let unseen = block
             .batches
@@ -651,9 +650,9 @@ impl State<'_, '_> {
         if v == to {
             self.add_order_vote(to, r, signed);
         } else {
-            for (_, at) in self.net.send(self.env.topo, signed, v, &[to], VOTE_BYTES) {
-                self.q.push(at, Event::Vote { to, r });
-            }
+            self.net.send(self.env.topo, signed, v, &[to], VOTE_BYTES, &mut self.q, |_| {
+                Event::Vote { to, r }
+            });
         }
     }
 
@@ -670,9 +669,8 @@ impl State<'_, '_> {
         self.on_qc(to, blk, qc);
         self.resolve(r, false, qc);
         if self.env.cfg.qc_broadcast {
-            for (v, at) in self.net.broadcast(self.env.topo, qc, to, QC_BYTES) {
-                self.q.push(at, Event::Qc { v, r });
-            }
+            self.net
+                .broadcast(self.env.topo, qc, to, QC_BYTES, &mut self.q, |v| Event::Qc { v, r });
         }
         self.enter_round(to, r + 1, qc);
     }
@@ -682,9 +680,9 @@ impl State<'_, '_> {
         self.last_voted[v] = self.last_voted[v].max(r);
         self.consecutive_timeouts[v] += 1;
         let signed = self.cpu.sig(v, at, self.env.crypto.bls_sign);
-        for (u, t) in self.net.broadcast(self.env.topo, signed, v, VOTE_BYTES + QC_BYTES) {
-            self.q.push(t, Event::Timeout { v: u, r, high_qc: self.high_qc[v] });
-        }
+        self.net.broadcast(self.env.topo, signed, v, VOTE_BYTES + QC_BYTES, &mut self.q, |u| {
+            Event::Timeout { v: u, r, high_qc: self.high_qc[v] }
+        });
         self.on_timeout(v, r, signed);
     }
 
@@ -764,8 +762,7 @@ impl State<'_, '_> {
                 .iter()
                 .flat_map(|&b| self.batches[b].txs.iter().copied())
                 .collect();
-            let res = self.engine.execute(order.iter().map(|&i| &txs[i]));
-            self.failed_txs += res.failed;
+            self.engine.as_ref().expect("running").submit(order.iter().map(|&i| &txs[i]));
             self.engine_next += 1;
         }
     }
@@ -779,9 +776,9 @@ impl State<'_, '_> {
         if self.env.cfg.is_honest(v) {
             self.add_exec_vote(v, blk, signed);
         }
-        for (u, at) in self.net.broadcast(self.env.topo, signed, v, VOTE_BYTES) {
-            self.q.push(at, Event::ExecVote { v: u, from: v, blk });
-        }
+        self.net.broadcast(self.env.topo, signed, v, VOTE_BYTES, &mut self.q, |u| {
+            Event::ExecVote { v: u, from: v, blk }
+        });
     }
 
     /// Schedules execution of the next block on `v`'s branch: the committed block at the next
@@ -853,7 +850,8 @@ impl State<'_, '_> {
         }
     }
 
-    fn finish(self) -> Report {
+    fn finish(mut self) -> Report {
+        let failed_txs = self.engine.take().expect("running").finish();
         let cfg = self.env.cfg;
         let txs = &self.env.workload.txs;
         let honest: Vec<usize> = (0..self.n).filter(|&v| cfg.is_honest(v)).collect();
@@ -964,7 +962,7 @@ impl State<'_, '_> {
             ("batch signed -> PoA, median (ms)".to_string(), poa_latency),
             ("mean block execution (ms)".to_string(), format!("{:.1}", mean_exec / 1000.0)),
             ("blocks not committed".to_string(), orphaned.to_string()),
-            ("failed txs".to_string(), self.failed_txs.to_string()),
+            ("failed txs".to_string(), failed_txs.to_string()),
         ];
         Report::build(
             cfg,
@@ -974,7 +972,8 @@ impl State<'_, '_> {
                 times: &times,
                 block_times: &block_times,
                 cpu: &self.cpu,
-                net: &self.net,
+                bytes_sent: &self.net.bytes_sent,
+                real: self.net.real_stats(),
                 block,
                 extra,
             },

@@ -49,6 +49,11 @@ impl<E> EventQueue<E> {
         self.heap.push(Entry { time, seq: self.seq, event });
     }
 
+    /// Time of the earliest event.
+    pub fn peek_time(&self) -> Option<u64> {
+        self.heap.peek().map(|e| e.time)
+    }
+
     /// Removes the earliest event.
     pub fn pop(&mut self) -> Option<(u64, E)> {
         self.heap.pop().map(|e| (e.time, e.event))

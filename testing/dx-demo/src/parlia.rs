@@ -15,8 +15,9 @@
 use std::collections::HashMap;
 
 use crate::{
-    exec::ExecEngine,
+    exec::BackgroundExec,
     net::Network,
+    realnet::Cluster,
     report::{median, percentile_ms, BlockStats, Report, RunOutput, TxTimes},
     sim::{Cpu, EventQueue},
     Env,
@@ -88,9 +89,16 @@ pub fn run(env: &Env<'_>) -> Report {
 
     let mut q = EventQueue::default();
     let mut cpu = Cpu::new(n, cfg.sig_cores, window);
-    let mut net =
-        Network::new(n, cfg.bandwidth_mbps, window.0, (cfg.jitter_ms * 1000.0) as u64, cfg.seed);
-    let mut engine = ExecEngine::new(env.workload.accounts);
+    let cluster = env.realnet.map(|spec| Cluster::launch(spec, n));
+    let mut net = Network::new(
+        n,
+        cfg.bandwidth_mbps,
+        window.0,
+        (cfg.jitter_ms * 1000.0) as u64,
+        cfg.seed,
+        cluster,
+    );
+    let engine = BackgroundExec::new(env.workload.accounts);
 
     let in_turn = |h: u64| ((h / cfg.turn_length) as usize) % n;
     // Who builds canonical block `h` and how long after the block time it may seal.
@@ -121,7 +129,6 @@ pub fn run(env: &Env<'_>) -> Report {
     let mut vote_times: Vec<Vec<Vec<u64>>> = vec![vec![Vec::new(); n]];
     let mut included = vec![false; txs.len()];
     let mut first_pending = 0usize;
-    let mut failed_txs = 0usize;
 
     let (first, delay) = builder(1);
     q.push(delay, Event::Build { h: 1, v: first });
@@ -129,7 +136,7 @@ pub fn run(env: &Env<'_>) -> Report {
         q.push(interval, Event::BadBlock(1));
     }
 
-    while let Some((now, ev)) = q.pop() {
+    while let Some((now, ev)) = net.next(&mut q) {
         if now > end {
             break;
         }
@@ -149,9 +156,8 @@ pub fn run(env: &Env<'_>) -> Report {
                 while first_pending < txs.len() && included[first_pending] {
                     first_pending += 1;
                 }
-                let res = engine.execute(chosen.iter().map(|&i| &txs[i]));
-                failed_txs += res.failed;
-                let exec_cost = env.exec_model.block_cost(&res);
+                engine.submit(chosen.iter().map(|&i| &txs[i]));
+                let exec_cost = env.exec_model.cost_of(chosen.iter().map(|&i| &txs[i]));
                 // The miner executes transactions as they arrive, so building overlaps with the
                 // wait for the block time; it can only finish late if execution takes longer
                 // than the time left.
@@ -217,9 +223,9 @@ pub fn run(env: &Env<'_>) -> Report {
                 }
                 blocks[h as usize].relay = relay;
                 let block = BlockRef::Canonical(h);
-                for (v, at) in net.send(env.topo, now, p, first, blocks[h as usize].bytes) {
-                    q.push(at, Event::Arrive { v, block });
-                }
+                net.send(env.topo, now, p, first, blocks[h as usize].bytes, &mut q, |v| {
+                    Event::Arrive { v, block }
+                });
                 imported[h as usize][p] = Some(now);
                 q.push(now, Event::Imported { v: p, h });
                 // A wrongly executing in-turn validator for the next height produces its own
@@ -236,9 +242,10 @@ pub fn run(env: &Env<'_>) -> Report {
                 let bytes = HEADER_BYTES + chosen.iter().map(|&i| txs[i].size()).sum::<u64>();
                 let id = rejected.len();
                 rejected.push(RejectedBlock { sent: now, exec_cost, bytes });
-                for (v, at) in net.broadcast(env.topo, now, p, bytes) {
-                    q.push(at, Event::Arrive { v, block: BlockRef::Rejected(id) });
-                }
+                net.broadcast(env.topo, now, p, bytes, &mut q, |v| Event::Arrive {
+                    v,
+                    block: BlockRef::Rejected(id),
+                });
             }
             Event::Arrive { v, block } => {
                 if !cfg.is_honest(v) {
@@ -254,9 +261,9 @@ pub fn run(env: &Env<'_>) -> Report {
                         if !forward.is_empty() {
                             let checked = cpu.sig(v, now, env.crypto.ecdsa_recover);
                             let bytes = blocks[h as usize].bytes;
-                            for (u, at) in net.send(env.topo, checked, v, &forward, bytes) {
-                                q.push(at, Event::Arrive { v: u, block });
-                            }
+                            net.send(env.topo, checked, v, &forward, bytes, &mut q, |u| {
+                                Event::Arrive { v: u, block }
+                            });
                         }
                         if imported[h as usize - 1][v].is_some() {
                             import(env, &mut cpu, &mut q, &blocks, v, h, now);
@@ -273,9 +280,7 @@ pub fn run(env: &Env<'_>) -> Report {
                 }
                 let signed = cpu.sig(v, now, env.crypto.bls_sign);
                 vote_times[h as usize][v].push(signed);
-                for (u, at) in net.broadcast(env.topo, signed, v, VOTE_BYTES) {
-                    q.push(at, Event::Vote { v: u, h });
-                }
+                net.broadcast(env.topo, signed, v, VOTE_BYTES, &mut q, |u| Event::Vote { v: u, h });
                 // The next builder can start once it has the parent.
                 let (next, delay) = builder(h + 1);
                 if v == next && blocks.len() as u64 == h + 1 {
@@ -398,7 +403,7 @@ pub fn run(env: &Env<'_>) -> Report {
         ("blocks with an attestation".to_string(), format!("{attested_blocks} / {count}")),
         ("attestations below the parent".to_string(), format!("{lagged} / {count}")),
         ("mean block execution (ms)".to_string(), format!("{:.1}", mean_exec / 1000.0)),
-        ("failed txs".to_string(), failed_txs.to_string()),
+        ("failed txs".to_string(), engine.finish().to_string()),
     ];
     Report::build(
         cfg,
@@ -408,7 +413,8 @@ pub fn run(env: &Env<'_>) -> Report {
             times: &times,
             block_times: &block_times,
             cpu: &cpu,
-            net: &net,
+            bytes_sent: &net.bytes_sent,
+            real: net.real_stats(),
             block,
             extra,
         },
