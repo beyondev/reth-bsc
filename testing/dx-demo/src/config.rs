@@ -122,6 +122,12 @@ pub struct SimConfig {
     /// at the last moment (`--miner-reserve-ms`), as geth does today.
     #[arg(long)]
     pub lock_ms: Option<u64>,
+    /// Parlia with `--stream-chunk-ms` and `--bid-share`: bid transactions are locked chunk by
+    /// chunk as they reach the proposer, like local ones, so no bid arrives late and nothing is
+    /// executed again. The builder already executed them, so their chunks do not wait for the
+    /// proposer's own execution. Overrides `--lock-ms`.
+    #[arg(long)]
+    pub bid_stream: bool,
     /// Parlia: delay per backoff rank before another validator fills a missing in-turn block.
     #[arg(long, default_value_t = 1000)]
     pub backoff_ms: u64,

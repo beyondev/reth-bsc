@@ -624,6 +624,9 @@ mod tests {
         assert_eq!(streamed_share(&unlocked).as_deref(), Some("0.0%"));
         let locked = run(&["--stream-chunk-ms", "50", "--bid-share", "0.9", "--lock-ms", "150"]);
         assert!(locked.block.state_gap_p50_ms < unlocked.block.state_gap_p50_ms);
+        // A bid locked at the stream's pace imports no later than a block without one.
+        let paced = run(&["--stream-chunk-ms", "50", "--bid-share", "0.9", "--bid-stream"]);
+        assert!(paced.block.state_gap_p50_ms <= streamed.block.state_gap_p50_ms);
     }
 
     #[test]

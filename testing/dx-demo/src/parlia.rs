@@ -11,7 +11,7 @@
 //! newly appended transactions is signed and relayed at once, and validators that hold the parent
 //! execute it speculatively, so after the seal they only execute what is left. A builder bid
 //! (`--bid-share`) goes first in the block and can only be streamed once it is locked
-//! (`--lock-ms`).
+//! (`--lock-ms`), or is locked chunk by chunk like local transactions (`--bid-stream`).
 //!
 //! When the in-turn validator is down, or its blocks are rejected because it executes wrongly,
 //! the honest validator with the best backoff rank produces the block after `rank * backoff`.
@@ -600,7 +600,9 @@ impl StreamPlan {
     ///
     /// The first `bid_share` of the block is a builder bid, known only from the lock time on; the
     /// proposer already simulated it, so it streams at once. Local transactions follow it and
-    /// have to be executed again on top of it before they can be streamed. Every other transaction
+    /// have to be executed again on top of it before they can be streamed. With `--bid-stream`
+    /// bid transactions instead stream as they arrive, like local ones, but skip the proposer's
+    /// execution because the builder already ran them. Every other transaction
     /// joins the first chunk boundary after it reaches the proposer, and a chunk leaves once
     /// the proposer has executed it. The block's execution cost, less the per-block part, is
     /// split over the transactions by their cost.
@@ -615,7 +617,8 @@ impl StreamPlan {
         let cfg = env.cfg;
         let txs = &env.workload.txs;
         let bids = (cfg.bid_share * chosen.len() as f64).round() as usize;
-        let start = if bids > 0 {
+        let locked_late = bids > 0 && !cfg.bid_stream;
+        let start = if locked_late {
             let lock_ms = cfg.lock_ms.unwrap_or(cfg.miner_reserve_ms);
             self.now.max(self.block_time.saturating_sub(lock_ms * 1000))
         } else {
@@ -631,7 +634,7 @@ impl StreamPlan {
         let mut j = 0;
         while j < chosen.len() {
             let avail = |j: usize| {
-                if j < bids {
+                if j < bids && locked_late {
                     start
                 } else {
                     env.workload.arrival_at(chosen[j], v, env.topo).max(start)
@@ -643,7 +646,7 @@ impl StreamPlan {
             }
             // The bid goes out as a chunk of its own, so it does not wait for the proposer to
             // re-execute local transactions on top of it.
-            let limit = if j < bids { bids } else { chosen.len() };
+            let limit = if j < bids && locked_late { bids } else { chosen.len() };
             let mut end = j;
             let mut own = 0.0;
             let mut share = 0.0;
