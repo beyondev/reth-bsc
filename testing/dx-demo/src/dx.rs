@@ -14,6 +14,14 @@
 //!   sign an ExecVote for committed blocks and broadcast it. `2f + 1` matching ExecVotes form the
 //!   ExecCert. A leader may only propose height `h` once it holds the ExecCert of height `h - k`
 //!   (backpressure). ExecVotes from a wrongly executing validator never match.
+//! - Builder (`--dx-builder-share`, `dx-mev-scheme-a-detailed.md`): a share of the transactions
+//!   goes to a builder co-located with the leader instead of the batch layer, and is placed at the
+//!   head of the block. Either the proposal carries it inline, or (`--dx-builder-chunk-ms`) the
+//!   leader locks a chunk every interval while its round is open and broadcasts the body at once;
+//!   the proposal then only references the chunks, votes wait for the bodies, and validators
+//!   execute chunks on top of the parent before the proposal arrives.
+
+use std::collections::HashMap;
 
 use crate::{
     exec::BackgroundExec,
@@ -48,6 +56,11 @@ const D_SPEC: u64 = 8;
 const BODY_POLL_US: u64 = 1000;
 /// Cap on the timeout doubling exponent.
 const MAX_BACKOFF_EXP: u32 = 6;
+/// Builder chunk framing: the leader's `ChunkLock` (round, index, prefix hash, digest, builder,
+/// value, BLS signature).
+const CHUNK_LOCK_BYTES: u64 = 250;
+/// `ChunkRef` in a proposal: the lock without an ack aggregate.
+const CHUNK_REF_BYTES: u64 = 250;
 
 #[derive(Debug)]
 enum Event {
@@ -78,6 +91,33 @@ enum Event {
     Executed { v: usize, blk: usize },
     /// An ExecVote for `blk` from `from` reaches validator `v`.
     ExecVote { v: usize, from: usize, blk: usize },
+    /// The builder's leader locks the next chunk.
+    ChunkTick,
+    /// Builder chunk `c` reaches validator `v`.
+    ChunkArrive { v: usize, c: usize },
+    /// Validator `v` retries voting for `blk` once it holds every chunk body.
+    VoteReady { v: usize, blk: usize },
+    /// Validator `v` may start executing builder chunk `c` ahead of its proposal.
+    PreExecReady { v: usize, c: usize },
+    /// Validator `v` finished executing builder chunk `c` ahead of its proposal.
+    PreExecuted { v: usize, c: usize },
+}
+
+/// Builder transactions the leader of `round` locked together, at the head of its block.
+#[derive(Debug)]
+struct BuilderChunk {
+    /// Block the chunk was built on.
+    parent: usize,
+    txs: Vec<usize>,
+    gas: u64,
+    /// Execution cost of the chunk's transactions, without the per-block cost.
+    cost: f64,
+    /// Carried inline in the proposal instead of being broadcast on its own.
+    inline: bool,
+    /// Body stored (lock checked, senders recovered) at each validator.
+    stored_at: Vec<Option<u64>>,
+    /// Executed on top of `parent` ahead of the proposal at each validator.
+    pre_executed_at: Vec<Option<u64>>,
 }
 
 #[derive(Debug)]
@@ -119,6 +159,8 @@ struct Block {
     parent: usize,
     height: u64,
     batches: Vec<usize>,
+    /// Builder chunks at the head of the block.
+    chunks: Vec<usize>,
     proposed_at: u64,
     bytes: u64,
     after_tc: bool,
@@ -163,6 +205,17 @@ struct State<'a, 'e> {
     engine_next: u64,
     tcs: Vec<u64>,
     safe: bool,
+    chunks: Vec<BuilderChunk>,
+    /// Builder transactions in creation order; `builder_next` is the first not yet created.
+    builder_txs: Vec<usize>,
+    builder_next: usize,
+    /// Created builder transactions not in a live chunk.
+    builder_pool: Vec<usize>,
+    /// Builder chunks locked for each round, in order. A round's chunks may be locked before the
+    /// round starts, while the previous proposal waits for its QC.
+    round_chunks: HashMap<u64, Vec<usize>>,
+    /// Round the builder last locked a chunk for.
+    chunk_round: Option<u64>,
 }
 
 /// Runs the DX simulation and returns its report.
@@ -173,7 +226,12 @@ pub fn run(env: &Env<'_>) -> Report {
     let end = ((cfg.duration_s + env.drain_s) * 1e6) as u64;
 
     let mut owner_queue: Vec<Vec<(u64, usize)>> = vec![Vec::new(); n];
+    let mut builder_txs = Vec::new();
     for (i, tx) in env.workload.txs.iter().enumerate() {
+        if from_builder(tx, cfg.dx_builder_share) {
+            builder_txs.push(i);
+            continue;
+        }
         let owner = owner_of(tx, n);
         if cfg.is_up(owner) {
             owner_queue[owner].push((env.workload.arrival_at(i, owner, env.topo), i));
@@ -219,6 +277,12 @@ pub fn run(env: &Env<'_>) -> Report {
         engine_next: 1,
         tcs: Vec::new(),
         safe: true,
+        chunks: Vec::new(),
+        builder_txs,
+        builder_next: 0,
+        builder_pool: Vec::new(),
+        round_chunks: HashMap::new(),
+        chunk_round: None,
     };
     // Genesis: round 0 and block 0 are certified, committed, executed and have an ExecCert.
     let mut genesis_round = s.new_round(n - 1, cfg.turn_length - 1);
@@ -233,6 +297,9 @@ pub fn run(env: &Env<'_>) -> Report {
     genesis.cert_at = vec![Some(0); n];
     s.blocks.push(genesis);
 
+    if let (Some(ms), true) = (cfg.dx_builder_chunk_ms, cfg.dx_builder_share > 0.0) {
+        s.q.push(ms * 1000, Event::ChunkTick);
+    }
     let t_batch = cfg.t_batch_ms * 1000;
     for v in (0..n).filter(|&v| cfg.is_up(v)) {
         s.q.push(t_batch * v as u64 / n as u64, Event::BatchTick(v));
@@ -250,11 +317,21 @@ pub fn run(env: &Env<'_>) -> Report {
 
 /// Owner validator of a sender: a fixed hash of the sender modulo `n` (design §6.1).
 fn owner_of(tx: &Tx, n: usize) -> usize {
-    // SplitMix64 finalizer, so owners are uniform for any `n`.
-    let mut z = u64::from(tx.sender).wrapping_add(0x9e37_79b9_7f4a_7c15);
+    (mix(u64::from(tx.sender)) % n as u64) as usize
+}
+
+/// Whether a transaction reaches the builder instead of the batch layer. Decided per sender, so
+/// a sender's nonces never split between the two paths.
+fn from_builder(tx: &Tx, share: f64) -> bool {
+    share > 0.0 && ((mix(u64::from(tx.sender) ^ 0xb11d) % 1_000_000) as f64) < share * 1e6
+}
+
+/// SplitMix64 finalizer, so hashed buckets are uniform.
+const fn mix(x: u64) -> u64 {
+    let mut z = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    ((z ^ (z >> 31)) % n as u64) as usize
+    z ^ (z >> 31)
 }
 
 impl State<'_, '_> {
@@ -280,6 +357,7 @@ impl State<'_, '_> {
             parent,
             height,
             batches: Vec::new(),
+            chunks: Vec::new(),
             proposed_at: at,
             bytes: 0,
             after_tc: false,
@@ -403,6 +481,147 @@ impl State<'_, '_> {
                     }
                 }
             }
+            Event::ChunkTick => {
+                if let Some((r, leader, parent)) = self.builder_round() {
+                    self.lock_chunk(now, r, leader, parent, false);
+                }
+                let ms = cfg.dx_builder_chunk_ms.expect("ticks only run with chunks");
+                self.q.push(now + ms * 1000, Event::ChunkTick);
+            }
+            Event::ChunkArrive { v, c } => {
+                if !cfg.is_up(v) {
+                    return;
+                }
+                let checked = self.cpu.sig(v, now, crypto.bls_verify);
+                let txs = self.chunks[c].txs.len() as f64;
+                let stored = self.cpu.parallel(v, checked, txs * crypto.ecdsa_recover);
+                self.chunks[c].stored_at[v] = Some(stored.max(checked));
+                self.schedule_exec(now, v);
+            }
+            Event::VoteReady { v, blk } => self.try_vote(v, blk, now),
+            Event::PreExecReady { v, c } => {
+                if self.exec_chain[v].last() == Some(&self.chunks[c].parent) {
+                    let done = self.cpu.exec(v, now, self.chunks[c].cost);
+                    self.q.push(done, Event::PreExecuted { v, c });
+                } else {
+                    self.exec_busy[v] = false;
+                    self.schedule_exec(now, v);
+                }
+            }
+            Event::PreExecuted { v, c } => {
+                self.exec_busy[v] = false;
+                if self.exec_chain[v].last() == Some(&self.chunks[c].parent) {
+                    self.chunks[c].pre_executed_at[v] = Some(now);
+                }
+                self.schedule_exec(now, v);
+            }
+        }
+    }
+
+    /// Round the builder fills, with its leader and the block it builds on: the newest round while
+    /// its leader is in it and has not proposed, or, once it has, the round after it, built on that
+    /// proposal before it is certified (as the builder bids on the parent proposal, §4.1).
+    fn builder_round(&self) -> Option<(u64, usize, usize)> {
+        let r = self.rounds.len() - 1;
+        let round = &self.rounds[r];
+        let (r, leader, parent) = match round.block {
+            None if self.cur_round[round.leader] == r as u64 => {
+                (r as u64, round.leader, self.high_qc[round.leader])
+            }
+            None => return None,
+            Some(blk) => (r as u64 + 1, self.leader_after(r as u64, false).0, blk),
+        };
+        self.env.cfg.is_up(leader).then_some((r, leader, parent))
+    }
+
+    /// The leader of round `r` locks the builder transactions that have reached it into a chunk
+    /// on top of `parent` and, unless `inline`, broadcasts the body. Returns the chunk, if there
+    /// was anything to lock.
+    fn lock_chunk(
+        &mut self,
+        now: u64,
+        r: u64,
+        leader: usize,
+        parent: usize,
+        inline: bool,
+    ) -> Option<usize> {
+        let cfg = self.env.cfg;
+        let txs = &self.env.workload.txs;
+        if self.chunk_round != Some(r) {
+            // Chunks of a round that ended without a proposal are void; their transactions go
+            // back to the builder.
+            if let Some(old) = self.chunk_round {
+                let proposed = self.rounds.get(old as usize).is_some_and(|x| x.block.is_some());
+                if !proposed {
+                    self.release_chunks(old, None);
+                }
+            }
+            self.chunk_round = Some(r);
+        }
+        while self.builder_next < self.builder_txs.len() &&
+            txs[self.builder_txs[self.builder_next]].created_us <= now
+        {
+            self.builder_pool.push(self.builder_txs[self.builder_next]);
+            self.builder_next += 1;
+        }
+        let mut gas: u64 =
+            self.round_chunks.get(&r).into_iter().flatten().map(|&c| self.chunks[c].gas).sum();
+        let mut chosen = Vec::new();
+        let workload = self.env.workload;
+        let topo = self.env.topo;
+        self.builder_pool.retain(|&i| {
+            let tx = &txs[i];
+            let arrived = workload.arrival_at(i, leader, topo) <= now;
+            if arrived && gas + tx.gas_limit() <= cfg.gas_limit {
+                gas += tx.gas_limit();
+                chosen.push(i);
+                false
+            } else {
+                true
+            }
+        });
+        if chosen.is_empty() {
+            return None;
+        }
+        chosen.sort_unstable();
+        let c = self.chunks.len();
+        let chunk_gas = chosen.iter().map(|&i| txs[i].gas_limit()).sum();
+        let cost = chosen.iter().map(|&i| self.env.exec_model.tx_cost(&txs[i])).sum();
+        let bytes = CHUNK_LOCK_BYTES + chosen.iter().map(|&i| txs[i].size()).sum::<u64>();
+        let signed = self.cpu.sig(leader, now, self.env.crypto.bls_sign);
+        let mut chunk = BuilderChunk {
+            parent,
+            txs: chosen,
+            gas: chunk_gas,
+            cost,
+            inline,
+            stored_at: vec![None; self.n],
+            pre_executed_at: vec![None; self.n],
+        };
+        chunk.stored_at[leader] = Some(signed);
+        self.chunks.push(chunk);
+        self.round_chunks.entry(r).or_default().push(c);
+        if !inline {
+            self.net.broadcast(self.env.topo, signed, leader, bytes, &mut self.q, |v| {
+                Event::ChunkArrive { v, c }
+            });
+        }
+        Some(c)
+    }
+
+    /// Returns to the builder the transactions of round `r`'s chunks not built on `keep_parent`,
+    /// and drops those chunks from the round.
+    fn release_chunks(&mut self, r: u64, keep_parent: Option<usize>) {
+        let Some(list) = self.round_chunks.remove(&r) else { return };
+        let (kept, void): (Vec<usize>, Vec<usize>) =
+            list.into_iter().partition(|&c| Some(self.chunks[c].parent) == keep_parent);
+        for c in void {
+            self.builder_pool.extend_from_slice(&self.chunks[c].txs);
+        }
+        // Keep the pool in creation order, so a sender's nonces are locked in order.
+        self.builder_pool.sort_unstable();
+        if !kept.is_empty() {
+            self.round_chunks.insert(r, kept);
         }
     }
 
@@ -528,7 +747,14 @@ impl State<'_, '_> {
         }
         let parent = self.high_qc[leader];
         let height = self.blocks[parent].height + 1;
-        let mut gas = 0;
+        if cfg.dx_builder_share > 0.0 {
+            // Chunks locked on another parent (the round before ended in a TC) are void. What
+            // reached the builder since its last chunk is locked now, ahead of the proposal.
+            self.release_chunks(r, Some(parent));
+            self.lock_chunk(now, r, leader, parent, cfg.dx_builder_chunk_ms.is_none());
+        }
+        let chunks = self.round_chunks.get(&r).cloned().unwrap_or_default();
+        let mut gas: u64 = chunks.iter().map(|&c| self.chunks[c].gas).sum();
         let mut chosen = Vec::new();
         let mut remaining = Vec::with_capacity(self.open_poas.len());
         for &b in &self.open_poas {
@@ -548,19 +774,32 @@ impl State<'_, '_> {
         }
         let after_tc = self.rounds[r as usize - 1].via_tc;
         let mut block = self.new_block(r, leader, parent, height, now);
-        let txs = || {
-            chosen
-                .iter()
-                .flat_map(|&b| self.batches[b].txs.iter().map(|&i| &self.env.workload.txs[i]))
-        };
-        block.exec_cost = self.env.exec_model.cost_of(txs());
+        let workload_txs = &self.env.workload.txs;
+        let chunk_txs: Vec<usize> =
+            chunks.iter().flat_map(|&c| self.chunks[c].txs.iter().copied()).collect();
+        let txs =
+            || chosen.iter().flat_map(|&b| self.batches[b].txs.iter().map(|&i| &workload_txs[i]));
+        block.exec_cost =
+            self.env.exec_model.cost_of(chunk_txs.iter().map(|&i| &workload_txs[i]).chain(txs()));
         let inline_bytes =
             (txs().map(|t| t.size()).sum::<u64>() as f64 * cfg.dx_inline_share) as u64;
         block.inline_txs = txs().count() as f64 * cfg.dx_inline_share;
+        let mut chunk_bytes = 0;
+        for &c in &chunks {
+            let chunk = &self.chunks[c];
+            if chunk.inline {
+                chunk_bytes += chunk.txs.iter().map(|&i| workload_txs[i].size()).sum::<u64>();
+                block.inline_txs += chunk.txs.len() as f64;
+            } else {
+                chunk_bytes += CHUNK_REF_BYTES;
+            }
+        }
         block.bytes = PROPOSAL_HEADER_BYTES +
             chosen.len() as u64 * POA_BYTES +
             inline_bytes +
+            chunk_bytes +
             if after_tc { TC_BYTES } else { 0 };
+        block.chunks = chunks;
         block.after_tc = after_tc;
         block.batches = chosen;
         let bytes = block.bytes;
@@ -597,6 +836,12 @@ impl State<'_, '_> {
         let checked = self.cpu.sig(v, now, cost);
         let checked =
             self.cpu.parallel(v, now, block.inline_txs * crypto.ecdsa_recover).max(checked);
+        for i in 0..self.blocks[blk].chunks.len() {
+            let c = self.blocks[blk].chunks[i];
+            if self.chunks[c].inline && self.chunks[c].stored_at[v].is_none() {
+                self.chunks[c].stored_at[v] = Some(checked);
+            }
+        }
         // PoAs not yet in the cache are verified once, in parallel.
         let unseen = block
             .batches
@@ -619,10 +864,28 @@ impl State<'_, '_> {
             self.enter_round(v, r, verified);
         }
         self.enter_round(v, r, verified);
-        if self.cur_round[v] == r && r > self.last_voted[v] {
-            self.vote(v, r, verified);
-        }
+        self.try_vote(v, blk, verified);
         self.schedule_exec(verified, v);
+    }
+
+    /// Validator `v` votes for `blk` from `at` on, once it holds the body of every builder chunk
+    /// the proposal references.
+    fn try_vote(&mut self, v: usize, blk: usize, at: u64) {
+        let r = self.blocks[blk].round;
+        if self.cur_round[v] != r || r <= self.last_voted[v] {
+            return;
+        }
+        let mut ready = at;
+        for &c in &self.blocks[blk].chunks {
+            match self.chunks[c].stored_at[v] {
+                Some(t) => ready = ready.max(t),
+                None => {
+                    self.q.push(at + BODY_POLL_US, Event::VoteReady { v, blk });
+                    return;
+                }
+            }
+        }
+        self.vote(v, r, ready);
     }
 
     /// Validator `v` learns at `at` that block `blk` is certified.
@@ -752,15 +1015,22 @@ impl State<'_, '_> {
                     self.open_poas.push(b);
                 }
             }
+            for j in 0..self.blocks[sibling].chunks.len() {
+                let c = self.blocks[sibling].chunks[j];
+                self.builder_pool.extend_from_slice(&self.chunks[c].txs);
+            }
+            self.builder_pool.sort_unstable();
         }
         // Execute canonical blocks for real, in order, so gas and failures are real.
         while (self.engine_next as usize) < self.chain.len() {
             let blk = self.chain[self.engine_next as usize];
             let txs = &self.env.workload.txs;
-            let order: Vec<usize> = self.blocks[blk]
-                .batches
+            let block = &self.blocks[blk];
+            let order: Vec<usize> = block
+                .chunks
                 .iter()
-                .flat_map(|&b| self.batches[b].txs.iter().copied())
+                .flat_map(|&c| self.chunks[c].txs.iter().copied())
+                .chain(block.batches.iter().flat_map(|&b| self.batches[b].txs.iter().copied()))
                 .collect();
             self.engine.as_ref().expect("running").submit(order.iter().map(|&i| &txs[i]));
             self.engine_next += 1;
@@ -803,7 +1073,10 @@ impl State<'_, '_> {
         } else {
             None
         };
-        let Some(blk) = next else { return };
+        let Some(blk) = next else {
+            self.schedule_chunk_exec(now, v);
+            return;
+        };
         let block = &self.blocks[blk];
         let known = block.committed_at[v].or(block.known_at[v]).expect("known or committed");
         let mut ready = known.max(now);
@@ -811,8 +1084,34 @@ impl State<'_, '_> {
             // A missing body is still in flight (it was broadcast to everyone): poll for it.
             ready = ready.max(self.batches[b].body_at[v].unwrap_or(now + BODY_POLL_US));
         }
+        for &c in &block.chunks {
+            ready = ready.max(self.chunks[c].stored_at[v].unwrap_or(now + BODY_POLL_US));
+        }
         self.exec_busy[v] = true;
         self.q.push(ready, Event::ExecReady { v, blk });
+    }
+
+    /// With nothing else to execute, `v` executes the next builder chunk of the open round on top
+    /// of its parent, before the proposal arrives.
+    fn schedule_chunk_exec(&mut self, now: u64, v: usize) {
+        let Some(r) = self.chunk_round else { return };
+        if !self.env.cfg.speculative {
+            return;
+        }
+        let block = self.rounds.get(r as usize).and_then(|x| x.block);
+        if block.is_some_and(|b| self.blocks[b].known_at[v].is_some()) {
+            return;
+        }
+        let tip = *self.exec_chain[v].last().expect("genesis");
+        let Some(list) = self.round_chunks.get(&r) else { return };
+        let next = list.iter().copied().find(|&c| {
+            let chunk = &self.chunks[c];
+            chunk.parent == tip && !chunk.inline && chunk.pre_executed_at[v].is_none()
+        });
+        let Some(c) = next else { return };
+        let Some(stored) = self.chunks[c].stored_at[v] else { return };
+        self.exec_busy[v] = true;
+        self.q.push(stored.max(now), Event::PreExecReady { v, c });
     }
 
     fn execute(&mut self, now: u64, v: usize, blk: usize) {
@@ -831,7 +1130,22 @@ impl State<'_, '_> {
                 }
             }
         }
-        let done = self.cpu.exec(v, ready, self.blocks[blk].exec_cost);
+        let parent = self.blocks[blk].parent;
+        let mut cost = self.blocks[blk].exec_cost;
+        for &c in &self.blocks[blk].chunks {
+            match self.chunks[c].stored_at[v] {
+                Some(t) => ready = ready.max(t),
+                None => {
+                    self.q.push(now + BODY_POLL_US, Event::ExecReady { v, blk });
+                    return;
+                }
+            }
+            let chunk = &self.chunks[c];
+            if chunk.parent == parent && chunk.pre_executed_at[v].is_some() {
+                cost -= chunk.cost;
+            }
+        }
+        let done = self.cpu.exec(v, ready, cost.max(0.0));
         self.q.push(done, Event::Executed { v, blk });
     }
 
@@ -869,12 +1183,12 @@ impl State<'_, '_> {
             let ordered = at_median(&block.committed_at);
             let executed = at_median(&block.executed_at);
             let finalized = at_median(&block.cert_at);
-            for &b in &block.batches {
-                for &i in &self.batches[b].txs {
-                    times.ordered[i] = ordered;
-                    times.executed[i] = executed;
-                    times.finalized[i] = finalized;
-                }
+            let chunk_txs = block.chunks.iter().flat_map(|&c| self.chunks[c].txs.iter());
+            let batch_txs = block.batches.iter().flat_map(|&b| self.batches[b].txs.iter());
+            for &i in chunk_txs.chain(batch_txs) {
+                times.ordered[i] = ordered;
+                times.executed[i] = executed;
+                times.finalized[i] = finalized;
             }
         }
 
@@ -925,8 +1239,10 @@ impl State<'_, '_> {
             blocks_per_s: canonical.len() as f64 / window_s,
             tps: canonical
                 .iter()
-                .flat_map(|b| b.batches.iter())
-                .map(|&b| self.batches[b].txs.len())
+                .map(|b| {
+                    b.batches.iter().map(|&x| self.batches[x].txs.len()).sum::<usize>() +
+                        b.chunks.iter().map(|&c| self.chunks[c].txs.len()).sum::<usize>()
+                })
                 .sum::<usize>() as f64 /
                 window_s,
             critical_bytes: proposals.iter().sum::<u64>() as f64 / proposals.len().max(1) as f64,
@@ -956,7 +1272,7 @@ impl State<'_, '_> {
         let orphaned = self.blocks.len() - self.chain.len();
         let poa_latency =
             median(batch_wait).map_or("-".into(), |t| format!("{:.1}", t as f64 / 1000.0));
-        let extra = vec![
+        let mut extra = vec![
             ("batches".to_string(), self.batches.len().to_string()),
             ("PoAs per proposal (mean)".to_string(), format!("{mean_poas:.1}")),
             ("batch signed -> PoA, median (ms)".to_string(), poa_latency),
@@ -964,6 +1280,27 @@ impl State<'_, '_> {
             ("blocks not committed".to_string(), orphaned.to_string()),
             ("failed txs".to_string(), failed_txs.to_string()),
         ];
+        if cfg.dx_builder_share > 0.0 {
+            let blocks = canonical.len().max(1) as f64;
+            let chunks = canonical.iter().map(|b| b.chunks.len()).sum::<usize>() as f64;
+            let pre: usize = canonical
+                .iter()
+                .flat_map(|b| b.chunks.iter())
+                .map(|&c| {
+                    let chunk = &self.chunks[c];
+                    honest.iter().filter(|&&v| chunk.pre_executed_at[v].is_some()).count()
+                })
+                .sum();
+            let pre_share = 100.0 * pre as f64 / (chunks * honest.len() as f64).max(1.0);
+            extra.push((
+                "builder chunks per block (mean)".to_string(),
+                format!("{:.1}", chunks / blocks),
+            ));
+            extra.push((
+                "builder chunks executed before the proposal".to_string(),
+                format!("{pre_share:.1}%"),
+            ));
+        }
         Report::build(
             cfg,
             self.env.workload,

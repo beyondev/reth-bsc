@@ -630,6 +630,29 @@ mod tests {
     }
 
     #[test]
+    fn streamed_builder_chunks_keep_dx_proposals_small() {
+        let base =
+            ["--min-interval-ms", "50", "--bandwidth-mbps", "20", "--dx-builder-share", "0.9"];
+        let crypto = CryptoCosts::calibrate(small(&base).quorum());
+        let run = |extra: &[&str]| {
+            let cfg = small(&[&base[..], extra].concat());
+            run_scenario(&cfg, &crypto, Which::Dx).remove(0)
+        };
+        let inline = run(&[]);
+        let chunked = run(&["--dx-builder-chunk-ms", "25"]);
+        assert_eq!(inline.finalized_ratio, 1.0);
+        assert_eq!(chunked.finalized_ratio, 1.0);
+        assert!(chunked.block.safe);
+        assert!(
+            chunked.block.critical_bytes * 2.0 < inline.block.critical_bytes,
+            "{} vs {}",
+            chunked.block.critical_bytes,
+            inline.block.critical_bytes
+        );
+        assert!(chunked.block.blocks_per_s >= inline.block.blocks_per_s);
+    }
+
+    #[test]
     fn dx_rounds_follow_the_minimum_interval() {
         let crypto = CryptoCosts::calibrate(small(&[]).quorum());
         let slow = &run_scenario(&small(&["--min-interval-ms", "450"]), &crypto, Which::Dx)[0];

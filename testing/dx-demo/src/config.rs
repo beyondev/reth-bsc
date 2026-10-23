@@ -163,6 +163,19 @@ pub struct SimConfig {
     /// overstated when this is set.
     #[arg(long, default_value_t = 0.0)]
     pub dx_inline_share: f64,
+    /// DX: share of transactions that come from a builder (`dx-mev-scheme-a-detailed.md`). They
+    /// skip the batch layer and reach the builder, co-located with the leader, directly. Without
+    /// `--dx-builder-chunk-ms` the leader carries them inline in its proposal; the proposal
+    /// grows and receivers recover the senders before voting.
+    #[arg(long, default_value_t = 0.0)]
+    pub dx_builder_share: f64,
+    /// DX with `--dx-builder-share`: the leader locks a builder chunk this often while its round
+    /// is open and broadcasts its body at once (scheme A). The proposal then only carries chunk
+    /// references, a validator votes once it holds every chunk body, and validators holding the
+    /// parent execute chunks speculatively before the proposal arrives. Chunks travel over the
+    /// leader's uplink.
+    #[arg(long)]
+    pub dx_builder_chunk_ms: Option<u64>,
     /// DX: the leader that forms a QC broadcasts it at once instead of only carrying it in its
     /// next proposal, so validators commit one message hop earlier.
     #[arg(long)]
